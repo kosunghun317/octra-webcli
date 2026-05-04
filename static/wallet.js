@@ -463,8 +463,8 @@ function invalidateCurrentAddressState() {
 }
 
 var NETWORK_PRESETS = {
-  devent: {
-    label: 'devent',
+  devnet: {
+    label: 'devnet',
     rpc_url: 'http://165.227.225.79:8080',
     explorer_url: 'https://devnet.octrascan.io',
     bridge_signer_url: 'https://relayer-002838819188.octra.network',
@@ -1128,7 +1128,7 @@ function presetMatches(preset, rpc, explorer) {
 }
 
 function detectNetworkPreset(rpc, explorer) {
-  if (presetMatches('devent', rpc, explorer)) return 'devent';
+  if (presetMatches('devnet', rpc, explorer)) return 'devnet';
   if (presetMatches('mainnet', rpc, explorer)) return 'mainnet';
   return 'custom';
 }
@@ -1179,7 +1179,7 @@ function clearNetworkCaches() {
 function networkLabel(host) {
   if (_networkPreset !== 'custom') return _networkPreset;
   if (host === 'octra.network' || host === '46.101.86.250') return 'mainnet';
-  if (host === '165.227.225.79') return 'devent';
+  if (host === '165.227.225.79') return 'devnet';
   if (host === 'localhost' || host === '127.0.0.1') return 'local';
   return host;
 }
