@@ -30,6 +30,8 @@
 #include <vector>
 #include <atomic>
 #include <memory>
+#include <algorithm>
+#include <cctype>
 #include "lib/json.hpp"
 
 #include "lib/httplib.h"
@@ -97,14 +99,14 @@ public:
             cli.enable_server_certificate_verification(false);
             auto res = cli.Post(path_, hdrs, body, "application/json");
             if (!res) return {false, {}, "connection failed"};
-            return parse_response(res->body);
+            return parse_response(res->body, res->status, res->get_header_value("Content-Type"));
         } else {
             httplib::Client cli(host_, port_);
             cli.set_connection_timeout(timeout_sec, 0);
             cli.set_read_timeout(timeout_sec, 0);
             auto res = cli.Post(path_, hdrs, body, "application/json");
             if (!res) return {false, {}, "connection failed"};
-            return parse_response(res->body);
+            return parse_response(res->body, res->status, res->get_header_value("Content-Type"));
         }
     }
 
@@ -307,7 +309,18 @@ public:
     }
 
 private:
-    RpcResult parse_response(const std::string& body) {
+    static std::string body_prefix(const std::string& body) {
+        std::string out = body.substr(0, std::min<size_t>(body.size(), 160));
+        for (char& c : out) {
+            unsigned char uc = static_cast<unsigned char>(c);
+            if (std::iscntrl(uc) || std::isspace(uc)) c = ' ';
+        }
+        return out;
+    }
+
+    RpcResult parse_response(const std::string& body,
+                             int status = 0,
+                             const std::string& content_type = "") {
         try {
             auto j = nlohmann::json::parse(body);
             if (j.contains("result"))
@@ -319,9 +332,16 @@ private:
             }
             return {false, {}, "unknown rpc response"};
         } catch (const std::exception& ex) {
-            return {false, {}, std::string("parse error: ") + ex.what()};
+            return {
+                false,
+                {},
+                std::string("parse error: ") + ex.what()
+                    + " status=" + std::to_string(status)
+                    + " content_type=" + content_type
+                    + " body_prefix=" + body_prefix(body)
+            };
         }
     }
 };
 
-}
+} // namespace octra

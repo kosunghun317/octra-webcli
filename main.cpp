@@ -39,6 +39,7 @@
 #include <chrono>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #ifdef _WIN32
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -106,6 +107,8 @@ static std::mutex g_token_history_runtime_mtx;
 
 static std::unordered_map<std::string, std::vector<uint8_t>> g_pk_cache;
 static std::mutex g_pk_mtx;
+static std::unordered_set<std::string> g_bg_pvac_checked;
+static std::mutex g_bg_pvac_mtx;
 
 static std::optional<std::vector<uint8_t>> pk_cache_get(const std::string& addr) {
     std::lock_guard<std::mutex> lk(g_pk_mtx);
@@ -389,17 +392,47 @@ static json submit_tx(const octra::Transaction& tx) {
     return res;
 }
 
-static void ensure_pubkey_registered(const std::string& addr, const uint8_t sk[64], const std::string& pub_b64) {
-    auto vr = g_rpc.get_view_pubkey(addr);
+static bool rpc_lookup_failed_transiently(const std::string& error) {
+    return error.find("connection failed") != std::string::npos
+        || error.find("parse error") != std::string::npos
+        || error.find("non-json") != std::string::npos;
+}
+
+static bool has_registered_view_pubkey(const octra::RpcResult& vr) {
     if (vr.ok && vr.result.is_object() && vr.result.contains("view_pubkey")
-        && !vr.result["view_pubkey"].is_null() && vr.result["view_pubkey"].is_string())
-        return;
+        && !vr.result["view_pubkey"].is_null() && vr.result["view_pubkey"].is_string()
+        && !vr.result["view_pubkey"].get<std::string>().empty()) {
+        return true;
+    }
+    return false;
+}
+
+static bool ensure_pubkey_registered_on(octra::RpcClient& rpc,
+                                        const std::string& addr,
+                                        const uint8_t sk[64],
+                                        const std::string& pub_b64,
+                                        const char* prefix = "") {
+    auto vr = rpc.get_view_pubkey(addr);
+    if (has_registered_view_pubkey(vr)) return true;
+    if (!vr.ok && rpc_lookup_failed_transiently(vr.error)) {
+        fprintf(stderr, "%spubkey lookup failed for %s: %s; skipping register\n",
+                prefix, addr.c_str(), vr.error.c_str());
+        return false;
+    }
     std::string msg = "register_pubkey:" + addr;
     std::string sig = octra::ed25519_sign_detached(
         reinterpret_cast<const uint8_t*>(msg.data()), msg.size(), sk);
-    auto rr = g_rpc.register_public_key(addr, pub_b64, sig);
-    if (rr.ok) fprintf(stderr, "pubkey registered for %s\n", addr.c_str());
-    else fprintf(stderr, "pubkey register failed for %s: %s\n", addr.c_str(), rr.error.c_str());
+    auto rr = rpc.register_public_key(addr, pub_b64, sig);
+    if (rr.ok) {
+        fprintf(stderr, "%spubkey registered for %s\n", prefix, addr.c_str());
+        return true;
+    }
+    fprintf(stderr, "%spubkey register failed for %s: %s\n", prefix, addr.c_str(), rr.error.c_str());
+    return false;
+}
+
+static void ensure_pubkey_registered(const std::string& addr, const uint8_t sk[64], const std::string& pub_b64) {
+    ensure_pubkey_registered_on(g_rpc, addr, sk, pub_b64);
 }
 
 static bool g_pvac_foreign = false;
@@ -429,6 +462,10 @@ static void ensure_pvac_registered() {
         g_pvac_foreign = true;
         fprintf(stderr, "pvac key conflict: node has a different pvac key for %s\n",
                 g_wallet.addr.c_str());
+        return;
+    }
+    if (!pr.ok && rpc_lookup_failed_transiently(pr.error)) {
+        fprintf(stderr, "pvac pubkey lookup failed: %s; skipping register\n", pr.error.c_str());
         return;
     }
     auto pk_raw = g_pvac.serialize_pubkey();
@@ -3020,15 +3057,32 @@ int main(int argc, char** argv) {
                     auto entries = octra::load_manifest();
                     for (auto& e : entries) {
                         if (e.addr.empty() || e.file.empty()) continue;
-                        auto ar = g_rpc.get_account(e.addr);
-                        if (!ar.ok) continue;
                         try {
                             auto w = octra::load_wallet_encrypted(e.file, g_pin);
-                            ensure_pubkey_registered(w.addr, w.sk, w.pub_b64);
-                            auto pr = g_rpc.get_pvac_pubkey(e.addr);
+                            std::string cache_key = w.rpc_url + "|" + w.addr;
+                            {
+                                std::lock_guard<std::mutex> lk(g_bg_pvac_mtx);
+                                if (g_bg_pvac_checked.count(cache_key)) {
+                                    octra::secure_zero(w.sk, 64);
+                                    continue;
+                                }
+                            }
+
+                            octra::RpcClient rpc(w.rpc_url);
+                            auto ar = rpc.get_account(w.addr);
+                            if (!ar.ok) {
+                                octra::secure_zero(w.sk, 64);
+                                continue;
+                            }
+
+                            ensure_pubkey_registered_on(rpc, w.addr, w.sk, w.pub_b64, "[bg] ");
+                            auto pr = rpc.get_pvac_pubkey(w.addr);
                             bool pvac_ok = pr.ok && pr.result.is_object() && !pr.result["pvac_pubkey"].is_null()
                                 && pr.result["pvac_pubkey"].is_string() && !pr.result["pvac_pubkey"].get<std::string>().empty();
-                            if (!pvac_ok) {
+                            if (pvac_ok) {
+                                std::lock_guard<std::mutex> lk(g_bg_pvac_mtx);
+                                g_bg_pvac_checked.insert(cache_key);
+                            } else if (pr.ok || !rpc_lookup_failed_transiently(pr.error)) {
                                 octra::PvacBridge tmp_pvac;
                                 if (tmp_pvac.init(w.priv_b64)) {
                                     auto pk_raw = tmp_pvac.serialize_pubkey();
@@ -3036,10 +3090,21 @@ int main(int argc, char** argv) {
                                     std::string pk_b64 = tmp_pvac.serialize_pubkey_b64();
                                     std::string reg_sig = octra::sign_register_request(w.addr, pk_blob, w.sk);
                                     std::string kat = compute_aes_kat_hex();
-                                    auto rr = g_rpc.register_pvac_pubkey(w.addr, pk_b64, reg_sig, w.pub_b64, kat);
-                                    if (rr.ok) fprintf(stderr, "[bg] pvac registered %s\n", w.addr.c_str());
-                                    else fprintf(stderr, "[bg] pvac failed %s: %s\n", w.addr.c_str(), rr.error.c_str());
+                                    auto rr = rpc.register_pvac_pubkey(w.addr, pk_b64, reg_sig, w.pub_b64, kat);
+                                    if (rr.ok) {
+                                        fprintf(stderr, "[bg] pvac registered %s\n", w.addr.c_str());
+                                        std::lock_guard<std::mutex> lk(g_bg_pvac_mtx);
+                                        g_bg_pvac_checked.insert(cache_key);
+                                    } else if (rr.error.find("already registered") != std::string::npos) {
+                                        std::lock_guard<std::mutex> lk(g_bg_pvac_mtx);
+                                        g_bg_pvac_checked.insert(cache_key);
+                                    } else {
+                                        fprintf(stderr, "[bg] pvac failed %s: %s\n", w.addr.c_str(), rr.error.c_str());
+                                    }
                                 }
+                            } else {
+                                fprintf(stderr, "[bg] pvac lookup failed %s: %s; skipping register\n",
+                                        w.addr.c_str(), pr.error.c_str());
                             }
                             octra::secure_zero(w.sk, 64);
                         } catch (...) {}
