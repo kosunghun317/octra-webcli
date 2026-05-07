@@ -79,8 +79,40 @@ open `http://127.0.0.1:8420` in your browser
 
 0. after opening the web interface in your browser, import your private key or create a new one directly in the modal window
 1. enter a 6 digit PIN code to encrypt (AES 256 GCM) your wallet 
-2. your wallet file is stored in `data/wallet.oct` 
+2. encrypted wallet files are stored under `data/`
 3. the PIN is required on every startup to unlock
+
+The current client also supports multiple encrypted wallet accounts under
+`data/` with a manifest at `data/accounts.json`. Legacy `wallet.json` files can
+be imported/migrated through the startup flow.
+
+## network settings
+
+Open the web UI settings page to choose the active network before compiling,
+deploying, viewing, or calling contracts.
+
+Presets:
+
+- `devnet`: RPC `http://165.227.225.79:8080`, explorer
+  `https://devnet.octrascan.io`
+- `mainnet`: RPC `https://octra.network`, explorer `https://octrascan.io`
+- `custom`: manually entered RPC, explorer, and bridge signer URL
+
+The settings page posts to `/api/settings`, persists the selected RPC/explorer
+inside the encrypted wallet file, updates the active RPC client, and clears the
+transaction cache when the RPC changes.
+
+Useful API endpoints for tooling:
+
+- `GET /api/wallet`: current address, public key, RPC, explorer, and bridge
+  signer settings.
+- `POST /api/wallet/derive-address`: derive the Octra address for a supplied
+  private key without switching accounts.
+- `POST /api/settings`: update RPC, explorer, and bridge signer values.
+- `POST /api/contract/compile-project`: compile an AppliedML project payload.
+- `POST /api/contract/deploy`: deploy compiled contract bytecode.
+- `POST /api/contract/call`: submit a state-changing contract call.
+- `GET /api/contract/view`: run a contract view call.
 
 
 we adhere to a policy of completely eliminating third-party software where possible, we have zero tolerance for vendor dependencies, we only included well-known libs and point implementations in the build, the rest was completely written from scratch by hand to avoid the use of third-party code for security reasons
