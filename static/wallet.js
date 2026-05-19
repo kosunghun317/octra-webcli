@@ -2863,7 +2863,10 @@ async function revealPrivateKeys() {
   var pin = await modalPrompt('reveal private keys', 'enter 6-digit PIN', { pin: true, btnText: 'reveal' });
   if (!pin || !/^\d{6}$/.test(pin)) return;
   try {
-    var res = await api('POST', '/keys/private', { pin: pin });
+    var res = await api('POST', '/keys/private', {
+      pin: pin,
+      confirm: 'I_UNDERSTAND_KEY_EXPORT_RISK'
+    });
     var pkCell = $('privkey-cell');
     if (pkCell) {
       pkCell.className = 'mono';
