@@ -69,7 +69,10 @@ inline std::string json_escape(const std::string& s) {
             case '\n': r += "\\n";  break;
             case '\r': r += "\\r";  break;
             case '\t': r += "\\t";  break;
-            default: r += c;
+
+
+            
+            default:   r += c;
         }
     }
     return r;
@@ -146,6 +149,19 @@ inline std::string sha256_hex(const std::string& data) {
         hex += buf;
     }
     return hex;
+}
+
+inline std::string sign_circle_read_request(const std::string& op,
+                                            const std::string& circle_id,
+                                            const std::string& addr,
+                                            const std::string& subject,
+                                            const uint8_t sk[64]) {
+    std::string msg = op + "|" + circle_id + "|" + addr;
+    if (!subject.empty()) {
+        msg += "|" + subject;
+    }
+    return ed25519_sign_detached(
+        reinterpret_cast<const uint8_t*>(msg.data()), msg.size(), sk);
 }
 
 inline std::string sign_register_request(const std::string& addr,

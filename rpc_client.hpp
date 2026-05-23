@@ -197,6 +197,328 @@ public:
         return call("circle_info", {circle_id}, 10);
     }
 
+    RpcResult circle_info_auth(const std::string& circle_id,
+                               const std::string& addr,
+                               const std::string& pub_b64,
+                               const std::string& sig_b64) {
+        return call("octra_circleInfoAuth", {circle_id, addr, pub_b64, sig_b64}, 10);
+    }
+
+    RpcResult circle_program_info(const std::string& circle_id) {
+        return call("octra_circleProgramInfo", {circle_id}, 15);
+    }
+
+    RpcResult circle_program_info_auth(const std::string& circle_id,
+                                       const std::string& addr,
+                                       const std::string& pub_b64,
+                                       const std::string& sig_b64) {
+        return call("octra_circleProgramInfoAuth", {circle_id, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_view(const std::string& circle_id,
+                          const std::string& method,
+                          const nlohmann::json& params,
+                          const std::string& caller,
+                          bool include_storage = false) {
+        return call("octra_circleView", {circle_id, method, params, caller, include_storage}, 15);
+    }
+
+    RpcResult circle_view_auth(const std::string& circle_id,
+                               const std::string& method,
+                               const nlohmann::json& params,
+                               const std::string& addr,
+                               const std::string& pub_b64,
+                               const std::string& sig_b64,
+                               bool include_storage = false) {
+        return call("octra_circleViewAuth", {circle_id, method, params, addr, pub_b64, sig_b64, include_storage}, 15);
+    }
+
+    RpcResult circle_slot_policy(const std::string& circle_id, const std::string& slot_ref) {
+        return call("octra_circleSlotPolicy", {circle_id, slot_ref}, 15);
+    }
+
+    RpcResult circle_slot_policy_auth(const std::string& circle_id,
+                                      const std::string& slot_ref,
+                                      const std::string& addr,
+                                      const std::string& pub_b64,
+                                      const std::string& sig_b64) {
+        return call("octra_circleSlotPolicyAuth", {circle_id, slot_ref, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_state_policy(const std::string& circle_id, const std::string& state_ref) {
+        return call("octra_circleStatePolicy", {circle_id, state_ref}, 15);
+    }
+
+    RpcResult circle_state_policy_auth(const std::string& circle_id,
+                                       const std::string& state_ref,
+                                       const std::string& addr,
+                                       const std::string& pub_b64,
+                                       const std::string& sig_b64) {
+        return call("octra_circleStatePolicyAuth", {circle_id, state_ref, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_state_descriptor(const std::string& circle_id, const std::string& state_ref) {
+        return call("octra_circleStateDescriptor", {circle_id, state_ref}, 15);
+    }
+
+    RpcResult circle_state_descriptor_auth(const std::string& circle_id,
+                                           const std::string& state_ref,
+                                           const std::string& addr,
+                                           const std::string& pub_b64,
+                                           const std::string& sig_b64) {
+        return call("octra_circleStateDescriptorAuth", {circle_id, state_ref, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_balance_cell(const std::string& circle_id, const std::string& state_ref) {
+        return call("octra_circleBalanceCell", {circle_id, state_ref}, 15);
+    }
+
+    RpcResult circle_balance_cell_auth(const std::string& circle_id,
+                                       const std::string& state_ref,
+                                       const std::string& addr,
+                                       const std::string& pub_b64,
+                                       const std::string& sig_b64) {
+        return call("octra_circleBalanceCellAuth", {circle_id, state_ref, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_register_cell(const std::string& circle_id, const std::string& state_ref) {
+        return call("octra_circleRegisterCell", {circle_id, state_ref}, 15);
+    }
+
+    RpcResult circle_register_cell_auth(const std::string& circle_id,
+                                        const std::string& state_ref,
+                                        const std::string& addr,
+                                        const std::string& pub_b64,
+                                        const std::string& sig_b64) {
+        return call("octra_circleRegisterCellAuth", {circle_id, state_ref, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_balance_binding(const std::string& circle_id, const std::string& subject_addr) {
+        return call("octra_circleBalanceBinding", {circle_id, subject_addr}, 15);
+    }
+
+    RpcResult circle_balance_binding_auth(const std::string& circle_id,
+                                          const std::string& subject_addr,
+                                          const std::string& addr,
+                                          const std::string& pub_b64,
+                                          const std::string& sig_b64) {
+        return call("octra_circleBalanceBindingAuth", {circle_id, subject_addr, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_register_binding(const std::string& circle_id, const std::string& register_ref) {
+        return call("octra_circleRegisterBinding", {circle_id, register_ref}, 15);
+    }
+
+    RpcResult circle_register_binding_auth(const std::string& circle_id,
+                                           const std::string& register_ref,
+                                           const std::string& addr,
+                                           const std::string& pub_b64,
+                                           const std::string& sig_b64) {
+        return call("octra_circleRegisterBindingAuth", {circle_id, register_ref, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_balance_workflow(const std::string& circle_id, const std::string& workflow_ref) {
+        return call("octra_circleBalanceWorkflow", {circle_id, workflow_ref}, 15);
+    }
+
+    RpcResult circle_balance_workflow_auth(const std::string& circle_id,
+                                           const std::string& workflow_ref,
+                                           const std::string& addr,
+                                           const std::string& pub_b64,
+                                           const std::string& sig_b64) {
+        return call("octra_circleBalanceWorkflowAuth", {circle_id, workflow_ref, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_register_workflow(const std::string& circle_id, const std::string& workflow_ref) {
+        return call("octra_circleRegisterWorkflow", {circle_id, workflow_ref}, 15);
+    }
+
+    RpcResult circle_register_workflow_auth(const std::string& circle_id,
+                                            const std::string& workflow_ref,
+                                            const std::string& addr,
+                                            const std::string& pub_b64,
+                                            const std::string& sig_b64) {
+        return call("octra_circleRegisterWorkflowAuth", {circle_id, workflow_ref, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_object_summary(const std::string& circle_id, const std::string& object_ref) {
+        return call("octra_circleObjectSummary", {circle_id, object_ref}, 15);
+    }
+
+    RpcResult circle_object_summary_auth(const std::string& circle_id,
+                                         const std::string& object_ref,
+                                         const std::string& addr,
+                                         const std::string& pub_b64,
+                                         const std::string& sig_b64) {
+        return call("octra_circleObjectSummaryAuth", {circle_id, object_ref, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_object_members(const std::string& circle_id, const std::string& object_ref) {
+        return call("octra_circleObjectMembers", {circle_id, object_ref}, 15);
+    }
+
+    RpcResult circle_object_members_auth(const std::string& circle_id,
+                                         const std::string& object_ref,
+                                         const std::string& addr,
+                                         const std::string& pub_b64,
+                                         const std::string& sig_b64) {
+        return call("octra_circleObjectMembersAuth", {circle_id, object_ref, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_object_detail(const std::string& circle_id, const std::string& object_ref) {
+        return call("octra_circleObjectDetail", {circle_id, object_ref}, 15);
+    }
+
+    RpcResult circle_object_detail_auth(const std::string& circle_id,
+                                        const std::string& object_ref,
+                                        const std::string& addr,
+                                        const std::string& pub_b64,
+                                        const std::string& sig_b64) {
+        return call("octra_circleObjectDetailAuth", {circle_id, object_ref, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_object_member(const std::string& circle_id,
+                                   const std::string& object_ref,
+                                   const std::string& member_ref) {
+        return call("octra_circleObjectMember", {circle_id, object_ref, member_ref}, 15);
+    }
+
+    RpcResult circle_object_member_auth(const std::string& circle_id,
+                                        const std::string& object_ref,
+                                        const std::string& member_ref,
+                                        const std::string& addr,
+                                        const std::string& pub_b64,
+                                        const std::string& sig_b64) {
+        return call("octra_circleObjectMemberAuth", {circle_id, object_ref, member_ref, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_object_refs(const std::string& circle_id) {
+        return call("octra_circleObjectRefs", {circle_id}, 15);
+    }
+
+    RpcResult circle_object_refs_auth(const std::string& circle_id,
+                                      const std::string& addr,
+                                      const std::string& pub_b64,
+                                      const std::string& sig_b64) {
+        return call("octra_circleObjectRefsAuth", {circle_id, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_object_list(const std::string& circle_id) {
+        return call("octra_circleObjectList", {circle_id}, 15);
+    }
+
+    RpcResult circle_object_list_auth(const std::string& circle_id,
+                                      const std::string& addr,
+                                      const std::string& pub_b64,
+                                      const std::string& sig_b64) {
+        return call("octra_circleObjectListAuth", {circle_id, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_transport_policy(const std::string& circle_id) {
+        return call("octra_circleTransportPolicy", {circle_id}, 15);
+    }
+
+    RpcResult circle_transport_policy_auth(const std::string& circle_id,
+                                           const std::string& addr,
+                                           const std::string& pub_b64,
+                                           const std::string& sig_b64) {
+        return call("octra_circleTransportPolicyAuth", {circle_id, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_hfhe_policy(const std::string& circle_id) {
+        return call("octra_circleHfhePolicy", {circle_id}, 15);
+    }
+
+    RpcResult circle_hfhe_policy_auth(const std::string& circle_id,
+                                      const std::string& addr,
+                                      const std::string& pub_b64,
+                                      const std::string& sig_b64) {
+        return call("octra_circleHfhePolicyAuth", {circle_id, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_key_policy(const std::string& circle_id, const std::string& key_id) {
+        return call("octra_circleKeyPolicy", {circle_id, key_id}, 15);
+    }
+
+    RpcResult circle_key_policy_auth(const std::string& circle_id,
+                                     const std::string& key_id,
+                                     const std::string& addr,
+                                     const std::string& pub_b64,
+                                     const std::string& sig_b64) {
+        return call("octra_circleKeyPolicyAuth", {circle_id, key_id, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_storage(const std::string& circle_id, const std::string& key) {
+        return call("octra_circleStorage", {circle_id, key}, 15);
+    }
+
+    RpcResult circle_storage_auth(const std::string& circle_id,
+                                  const std::string& key,
+                                  const std::string& addr,
+                                  const std::string& pub_b64,
+                                  const std::string& sig_b64) {
+        return call("octra_circleStorageAuth", {circle_id, key, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_storage_dump(const std::string& circle_id) {
+        return call("octra_circleStorageDump", {circle_id}, 15);
+    }
+
+    RpcResult circle_storage_dump_auth(const std::string& circle_id,
+                                       const std::string& addr,
+                                       const std::string& pub_b64,
+                                       const std::string& sig_b64) {
+        return call("octra_circleStorageDumpAuth", {circle_id, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_outbox_intent(const std::string& circle_id, const std::string& intent_id) {
+        return call("octra_circleOutboxIntent", {circle_id, intent_id}, 15);
+    }
+
+    RpcResult circle_outbox_claim(const std::string& circle_id, const std::string& intent_id) {
+        return call("octra_circleOutboxClaim", {circle_id, intent_id}, 15);
+    }
+
+    RpcResult circle_outbox_claim_auth(const std::string& circle_id,
+                                       const std::string& intent_id,
+                                       const std::string& addr,
+                                       const std::string& pub_b64,
+                                       const std::string& sig_b64) {
+        return call("octra_circleOutboxClaimAuth", {circle_id, intent_id, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_outbox_intent_auth(const std::string& circle_id,
+                                        const std::string& intent_id,
+                                        const std::string& addr,
+                                        const std::string& pub_b64,
+                                        const std::string& sig_b64) {
+        return call("octra_circleOutboxIntentAuth", {circle_id, intent_id, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_outbox_status(const std::string& circle_id, const std::string& intent_id) {
+        return call("octra_circleOutboxStatus", {circle_id, intent_id}, 15);
+    }
+
+    RpcResult circle_outbox_status_auth(const std::string& circle_id,
+                                        const std::string& intent_id,
+                                        const std::string& addr,
+                                        const std::string& pub_b64,
+                                        const std::string& sig_b64) {
+        return call("octra_circleOutboxStatusAuth", {circle_id, intent_id, addr, pub_b64, sig_b64}, 15);
+    }
+
+    RpcResult circle_ingress_packet(const std::string& circle_id, const std::string& intent_id) {
+        return call("octra_circleIngressPacket", {circle_id, intent_id}, 15);
+    }
+
+    RpcResult circle_ingress_packet_auth(const std::string& circle_id,
+                                         const std::string& intent_id,
+                                         const std::string& addr,
+                                         const std::string& pub_b64,
+                                         const std::string& sig_b64) {
+        return call("octra_circleIngressPacketAuth", {circle_id, intent_id, addr, pub_b64, sig_b64}, 15);
+    }
+
     RpcResult circle_asset(const std::string& circle_id, const std::string& path) {
         return call("circle_asset", {circle_id, path}, 10);
     }
@@ -205,8 +527,48 @@ public:
         return call("circle_asset_ciphertext", {circle_id, path}, 10);
     }
 
+    RpcResult circle_asset_ciphertext_auth(const std::string& circle_id,
+                                           const std::string& path,
+                                           const std::string& addr,
+                                           const std::string& pub_b64,
+                                           const std::string& sig_b64) {
+        return call("octra_circleAssetCiphertextAuth", {circle_id, path, addr, pub_b64, sig_b64}, 10);
+    }
+
     RpcResult circle_asset_ciphertext_by_resource_key(const std::string& circle_id, const std::string& resource_key) {
         return call("circle_asset_ciphertext_by_resource_key", {circle_id, resource_key}, 10);
+    }
+
+    RpcResult circle_asset_ciphertext_by_resource_key_auth(const std::string& circle_id,
+                                                           const std::string& resource_key,
+                                                           const std::string& addr,
+                                                           const std::string& pub_b64,
+                                                           const std::string& sig_b64) {
+        return call("octra_circleAssetCiphertextByResourceKeyAuth", {circle_id, resource_key, addr, pub_b64, sig_b64}, 10);
+    }
+
+    RpcResult circle_asset_ciphertext_by_slot_ref(const std::string& circle_id, const std::string& slot_ref) {
+        return call("circle_asset_ciphertext_by_slot_ref", {circle_id, slot_ref}, 10);
+    }
+
+    RpcResult circle_asset_ciphertext_by_slot_ref_auth(const std::string& circle_id,
+                                                       const std::string& slot_ref,
+                                                       const std::string& addr,
+                                                       const std::string& pub_b64,
+                                                       const std::string& sig_b64) {
+        return call("octra_circleAssetCiphertextBySlotRefAuth", {circle_id, slot_ref, addr, pub_b64, sig_b64}, 10);
+    }
+
+    RpcResult circle_asset_ciphertext_by_state_ref(const std::string& circle_id, const std::string& state_ref) {
+        return call("octra_circleAssetCiphertextByStateRef", {circle_id, state_ref}, 10);
+    }
+
+    RpcResult circle_asset_ciphertext_by_state_ref_auth(const std::string& circle_id,
+                                                        const std::string& state_ref,
+                                                        const std::string& addr,
+                                                        const std::string& pub_b64,
+                                                        const std::string& sig_b64) {
+        return call("octra_circleAssetCiphertextByStateRefAuth", {circle_id, state_ref, addr, pub_b64, sig_b64}, 10);
     }
 
     RpcResult contract_receipt(const std::string& hash) {

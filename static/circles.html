@@ -314,6 +314,61 @@ body.circle-overlay-open {
   overflow: hidden;
 }
 
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 3200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(59, 86, 127, 0.36);
+}
+
+.modal-box {
+  width: min(520px, calc(100vw - 40px));
+  border: 1px solid #C0C6D0;
+  background: #FFFFFF;
+  box-shadow: 0 12px 28px rgba(59, 86, 127, 0.18);
+  padding: 18px;
+}
+
+.modal-title {
+  color: #3B567F;
+  font-size: 12px;
+  font-weight: bold;
+  text-transform: lowercase;
+  margin-bottom: 10px;
+}
+
+.modal-message {
+  color: #3B567F;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.5;
+}
+
+.modal-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.modal-btn {
+  border: 1px solid #C0C6D0;
+  background: #FFFFFF;
+  color: #3B567F;
+  font: inherit;
+  padding: 8px 14px;
+  cursor: pointer;
+  text-transform: lowercase;
+}
+
+.modal-btn-primary {
+  background: #EAF0F7;
+}
+
 @media (max-width: 980px) {
   .circle-browser-fields,
   .circle-authoring-grid,
@@ -510,6 +565,7 @@ const h256Raw = async (tag, parts) => {
 const h256Hex = async (tag, parts) => hexOfBytes(await h256Raw(tag, parts))
 
 const resourceKeyOfPath = (circleId, canonicalPath) => h256Hex('octra:circle_resource_key:v1', [utf8Bytes(circleId), utf8Bytes(canonicalPath)])
+const resourceKeyOfSlotRef = (circleId, slotRef) => h256Hex('octra:circle_resource_key:slot:v1', [utf8Bytes(circleId), utf8Bytes(slotRef)])
 
 const base58Encode = (bytes) => {
   const alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
@@ -819,14 +875,101 @@ const postBridgeReply = (target, token, id, ok, result, error) => {
 
 const bridgeMethodsForInfo = (info) => [
   'circle.context',
+  'program.info',
+  'program.view',
+  'program.call',
+  'program.storage',
+  'sealed_slot.read',
+  'sealed_slot.put',
+  'sealed_state.read',
+  'sealed_state.put',
+  'slot_policy.read',
+  'slot_policy.put',
+  'state_policy.read',
+  'state_policy.put',
+  'state_descriptor.read',
+  'state_descriptor.put',
+  'balance_cell.read',
+  'balance_cell.put',
+  'balance_binding.read',
+  'balance_workflow.read',
+  'object.refs.read',
+  'object.list.read',
+  'object.detail.read',
+  'object.member.read',
+  'object.summary.read',
+  'object.members.read',
+  'object.policy.define',
+  'object.bind',
+  'object.member.attach',
+  'object.member.detach',
+  'object.transition.apply',
+  'register_cell.read',
+  'register_cell.put',
+  'register_binding.read',
+  'register_workflow.read',
+  'transport_policy.read',
+  'transport_policy.put',
+  'hfhe_policy.read',
+  'hfhe_policy.put',
+  'key_policy.read',
+  'key_policy.put',
+  'key.grant',
+  'key.extend',
+  'key.revoke',
+  'key.erase',
+  'outbox.open',
+  'outbox.intent',
+  'outbox.claim',
+  'outbox.status',
+  'relay.claim',
+  'relay.cancel',
+  'ingress.commit',
+  'ingress.packet',
   'wallet.info',
   'wallet.balance',
   'wallet.keys',
+  'wallet.send',
+  'fhe.load_pk',
   'fhe.encrypt',
-  'fhe.decrypt'
+  'fhe.decrypt',
+  'fhe.commit',
+  'fhe.pedersen',
+  'fhe.serialize_cipher',
+  'fhe.deserialize_cipher',
+  'fhe.verify_zero',
+  'fhe.verify_range',
+  'fhe.verify_bound',
+  'relay.request',
+  'relay.status',
+  'relay.response',
+  'relay.receipt',
+  'relay.ingress',
+  'relay.health'
 ]
 
 const bridgeGrantTextOf = (context, method) => {
+  if (method === 'program.info' || method === 'program.view' || method === 'program.storage' || method === 'program.abi') {
+    return `allow this circle to read onchain program state for this session?\n\n${context.uri}`
+  }
+  if (method === 'program.call') {
+    return `allow this circle to submit onchain program calls for this session?\n\n${context.uri}`
+  }
+  if (method === 'sealed_slot.put' || method === 'sealed_state.put' || method === 'slot_policy.put' || method === 'state_policy.put' || method === 'state_descriptor.put' || method === 'balance_cell.put' || method === 'register_cell.put' || method === 'outbox.open' || method === 'ingress.commit') {
+    return `allow this circle to submit low-level circle runtime transactions for this session?\n\n${context.uri}`
+  }
+  if (method === 'object.policy.define' || method === 'object.bind' || method === 'object.member.attach' || method === 'object.member.detach' || method === 'object.transition.apply') {
+    return `allow this circle to submit private object runtime writes for this session?\n\n${context.uri}`
+  }
+  if (method === 'sealed_slot.read' || method === 'sealed_state.read' || method === 'slot_policy.read' || method === 'state_policy.read' || method === 'state_descriptor.read' || method === 'balance_cell.read' || method === 'balance_binding.read' || method === 'balance_workflow.read' || method === 'object.refs.read' || method === 'object.list.read' || method === 'object.detail.read' || method === 'object.member.read' || method === 'object.summary.read' || method === 'object.members.read' || method === 'register_cell.read' || method === 'register_binding.read' || method === 'register_workflow.read' || method === 'outbox.intent' || method === 'outbox.status' || method === 'ingress.packet') {
+    return `allow this circle to read low-level circle runtime state for this session?\n\n${context.uri}`
+  }
+  if (method === 'transport_policy.put' || method === 'hfhe_policy.put' || method === 'key_policy.put' || method === 'key.grant' || method === 'key.extend' || method === 'key.revoke' || method === 'key.erase' || method === 'relay.claim' || method === 'relay.cancel') {
+    return `allow this circle to modify low-level circle policy or relay transport state for this session?\n\n${context.uri}`
+  }
+  if (method === 'transport_policy.read' || method === 'hfhe_policy.read' || method === 'key_policy.read' || method === 'outbox.claim') {
+    return `allow this circle to read low-level circle policy or relay state for this session?\n\n${context.uri}`
+  }
   if (method === 'wallet.info') {
     return `allow this circle to read the active wallet address for this session?\n\n${context.uri}`
   }
@@ -836,13 +979,70 @@ const bridgeGrantTextOf = (context, method) => {
   if (method === 'wallet.keys') {
     return `allow this circle to read the wallet view public key for this session?\n\n${context.uri}`
   }
+  if (method === 'wallet.send') {
+    return `allow this circle to send OCT through the active wallet for this session?\n\n${context.uri}`
+  }
   if (method === 'fhe.encrypt') {
     return `allow this circle to request FHE encryption for this session?\n\n${context.uri}`
+  }
+  if (method === 'fhe.load_pk') {
+    return `allow this circle to request PVAC public keys for this session?\n\n${context.uri}`
   }
   if (method === 'fhe.decrypt') {
     return `allow this circle to request FHE decryption for this session?\n\n${context.uri}`
   }
+  if (method === 'fhe.commit') {
+    return `allow this circle to request FHE ciphertext commitments for this session?\n\n${context.uri}`
+  }
+  if (method === 'fhe.pedersen') {
+    return `allow this circle to request FHE amount commitments for this session?\n\n${context.uri}`
+  }
+  if (method === 'fhe.serialize_cipher') {
+    return `allow this circle to request canonical FHE cipher serialization for this session?\n\n${context.uri}`
+  }
+  if (method === 'fhe.deserialize_cipher') {
+    return `allow this circle to request canonical FHE cipher decoding for this session?\n\n${context.uri}`
+  }
+  if (method === 'fhe.verify_zero') {
+    return `allow this circle to request FHE zero-proof verification for this session?\n\n${context.uri}`
+  }
+  if (method === 'fhe.verify_range') {
+    return `allow this circle to request FHE range-proof verification for this session?\n\n${context.uri}`
+  }
+  if (method === 'fhe.verify_bound') {
+    return `allow this circle to request FHE bound-proof verification for this session?\n\n${context.uri}`
+  }
+  if (method.startsWith('relay.')) {
+    return `allow this circle to use the local relay membrane for this session?\n\n${context.uri}`
+  }
   return `allow this circle to use runtime access method ${method} for this session?\n\n${context.uri}`
+}
+
+const bridgeGrantScopeOf = (method) => {
+  if (method === 'circle.context') return 'circle.context'
+  if (method === 'program.call') return 'program.call'
+  if (method === 'program.info' || method === 'program.view' || method === 'program.storage' || method === 'program.abi') return 'program.read'
+  if (method === 'sealed_slot.put' || method === 'sealed_state.put' || method === 'slot_policy.put' || method === 'state_policy.put' || method === 'state_descriptor.put' || method === 'balance_cell.put' || method === 'register_cell.put' || method === 'outbox.open' || method === 'ingress.commit') return 'circle.write'
+  if (method === 'object.policy.define' || method === 'object.bind' || method === 'object.member.attach' || method === 'object.member.detach' || method === 'object.transition.apply') return 'circle.object.write'
+  if (method === 'sealed_slot.read' || method === 'sealed_state.read' || method === 'slot_policy.read' || method === 'state_policy.read' || method === 'state_descriptor.read' || method === 'balance_cell.read' || method === 'balance_binding.read' || method === 'balance_workflow.read' || method === 'object.refs.read' || method === 'object.list.read' || method === 'object.detail.read' || method === 'object.member.read' || method === 'object.summary.read' || method === 'object.members.read' || method === 'register_cell.read' || method === 'register_binding.read' || method === 'register_workflow.read' || method === 'outbox.intent' || method === 'outbox.status' || method === 'ingress.packet') return 'circle.read'
+  if (method === 'transport_policy.put' || method === 'hfhe_policy.put' || method === 'key_policy.put' || method === 'key.grant' || method === 'key.extend' || method === 'key.revoke' || method === 'key.erase' || method === 'relay.claim' || method === 'relay.cancel') return 'circle.policy.write'
+  if (method === 'transport_policy.read' || method === 'hfhe_policy.read' || method === 'key_policy.read' || method === 'outbox.claim') return 'circle.policy.read'
+  if (method === 'wallet.send') return 'wallet.send'
+  if (method === 'wallet.info') return 'wallet.info'
+  if (method === 'wallet.balance') return 'wallet.balance'
+  if (method === 'wallet.keys') return 'wallet.keys'
+  if (method === 'fhe.load_pk') return 'fhe.load_pk'
+  if (method === 'fhe.encrypt') return 'fhe.encrypt'
+  if (method === 'fhe.decrypt') return 'fhe.decrypt'
+  if (method === 'fhe.commit') return 'fhe.commit'
+  if (method === 'fhe.pedersen') return 'fhe.pedersen'
+  if (method === 'fhe.serialize_cipher') return 'fhe.serialize_cipher'
+  if (method === 'fhe.deserialize_cipher') return 'fhe.deserialize_cipher'
+  if (method === 'fhe.verify_zero') return 'fhe.verify_zero'
+  if (method === 'fhe.verify_range') return 'fhe.verify_range'
+  if (method === 'fhe.verify_bound') return 'fhe.verify_bound'
+  if (method.startsWith('relay.')) return 'relay.access'
+  return method
 }
 
 const ensureBridgeGrant = async (method) => {
@@ -852,7 +1052,7 @@ const ensureBridgeGrant = async (method) => {
   if (method === 'circle.context') {
     return
   }
-  const grantKey = `${activeBridgeContext.circle_id}:${method}`
+  const grantKey = `${activeBridgeContext.circle_id}:${bridgeGrantScopeOf(method)}`
   if (bridgeGrantState.get(grantKey)) {
     return
   }
@@ -874,6 +1074,291 @@ const bridgeResultOf = async (method, payload = {}) => {
   if (method === 'circle.context') {
     return activeBridgeContext
   }
+  const bridgeCircleId = activeBridgeContext.circle_id || ''
+  const requireBridgeCircleId = () => {
+    if (!bridgeCircleId) {
+      throw new Error('sealed bridge has no active circle target')
+    }
+    if (payload.address) {
+      throw new Error('bridge target override denied')
+    }
+    if (payload.circle_id && payload.circle_id !== bridgeCircleId) {
+      throw new Error('bridge target override denied')
+    }
+    return bridgeCircleId
+  }
+  if (method === 'program.info') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return fetchJson(`/api/program/info?circle_id=${encodeURIComponent(effectiveCircleId)}`)
+  }
+  if (method === 'program.view') {
+    const effectiveCircleId = requireBridgeCircleId()
+    const nextPayload = { ...payload, circle_id: effectiveCircleId }
+    return postJson('/api/program/view', nextPayload)
+  }
+  if (method === 'program.call') {
+    const effectiveCircleId = requireBridgeCircleId()
+    const nextPayload = { ...payload, circle_id: effectiveCircleId }
+    return postJson('/api/program/call', nextPayload)
+  }
+  if (method === 'program.storage') {
+    if (!payload.key) {
+      throw new Error('program.storage requires key')
+    }
+    const effectiveCircleId = requireBridgeCircleId()
+    return fetchJson(`/api/program/storage?circle_id=${encodeURIComponent(effectiveCircleId)}&key=${encodeURIComponent(payload.key)}`)
+  }
+  if (method === 'program.abi') {
+    throw new Error('program.abi disabled in native sealed mode')
+  }
+  if (method === 'sealed_slot.read') {
+    const effectiveCircleId = requireBridgeCircleId()
+    if (!payload.slot_ref) {
+      throw new Error('sealed_slot.read requires slot_ref')
+    }
+    return fetchJson(`/api/circle/asset_ciphertext_by_slot?circle_id=${encodeURIComponent(effectiveCircleId)}&slot_ref=${encodeURIComponent(payload.slot_ref)}`)
+  }
+  if (method === 'sealed_slot.put') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/sealed_slot_put', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'sealed_state.read') {
+    const effectiveCircleId = requireBridgeCircleId()
+    if (!payload.state_ref) {
+      throw new Error('sealed_state.read requires state_ref')
+    }
+    return fetchJson(`/api/circle/asset_ciphertext_by_state?circle_id=${encodeURIComponent(effectiveCircleId)}&state_ref=${encodeURIComponent(payload.state_ref)}`)
+  }
+  if (method === 'sealed_state.put') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/sealed_slot_put', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'slot_policy.read') {
+    const effectiveCircleId = requireBridgeCircleId()
+    if (!payload.slot_ref) {
+      throw new Error('slot_policy.read requires circle_id and slot_ref')
+    }
+    return fetchJson(`/api/circle/slot_policy?circle_id=${encodeURIComponent(effectiveCircleId)}&slot_ref=${encodeURIComponent(payload.slot_ref)}`)
+  }
+  if (method === 'slot_policy.put') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/slot_policy_put', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'state_policy.read') {
+    const effectiveCircleId = requireBridgeCircleId()
+    if (!payload.state_ref) {
+      throw new Error('state_policy.read requires state_ref')
+    }
+    return fetchJson(`/api/circle/state_policy?circle_id=${encodeURIComponent(effectiveCircleId)}&state_ref=${encodeURIComponent(payload.state_ref)}`)
+  }
+  if (method === 'state_policy.put') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/slot_policy_put', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'state_descriptor.read') {
+    const effectiveCircleId = requireBridgeCircleId()
+    if (!payload.state_ref) {
+      throw new Error('state_descriptor.read requires state_ref')
+    }
+    return fetchJson(`/api/circle/state_descriptor?circle_id=${encodeURIComponent(effectiveCircleId)}&state_ref=${encodeURIComponent(payload.state_ref)}`)
+  }
+  if (method === 'state_descriptor.put') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/state_descriptor_put', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'balance_cell.read') {
+    const effectiveCircleId = requireBridgeCircleId()
+    if (!payload.state_ref) {
+      throw new Error('balance_cell.read requires state_ref')
+    }
+    return fetchJson(`/api/circle/balance_cell?circle_id=${encodeURIComponent(effectiveCircleId)}&state_ref=${encodeURIComponent(payload.state_ref)}`)
+  }
+  if (method === 'balance_binding.read') {
+    const effectiveCircleId = requireBridgeCircleId()
+    if (!payload.subject_addr) {
+      throw new Error('balance_binding.read requires subject_addr')
+    }
+    return fetchJson(`/api/circle/balance_binding?circle_id=${encodeURIComponent(effectiveCircleId)}&subject_addr=${encodeURIComponent(payload.subject_addr)}`)
+  }
+  if (method === 'balance_workflow.read') {
+    const effectiveCircleId = requireBridgeCircleId()
+    if (!payload.workflow_ref) {
+      throw new Error('balance_workflow.read requires workflow_ref')
+    }
+    return fetchJson(`/api/circle/balance_workflow?circle_id=${encodeURIComponent(effectiveCircleId)}&workflow_ref=${encodeURIComponent(payload.workflow_ref)}`)
+  }
+  if (method === 'object.refs.read') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return fetchJson(`/api/circle/object_refs?circle_id=${encodeURIComponent(effectiveCircleId)}`)
+  }
+  if (method === 'object.list.read') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return fetchJson(`/api/circle/object_list?circle_id=${encodeURIComponent(effectiveCircleId)}`)
+  }
+  if (method === 'object.detail.read') {
+    const effectiveCircleId = requireBridgeCircleId()
+    if (!payload.object_ref) {
+      throw new Error('object.detail.read requires object_ref')
+    }
+    return fetchJson(`/api/circle/object_detail?circle_id=${encodeURIComponent(effectiveCircleId)}&object_ref=${encodeURIComponent(payload.object_ref)}`)
+  }
+  if (method === 'object.member.read') {
+    const effectiveCircleId = requireBridgeCircleId()
+    if (!payload.object_ref || !payload.member_ref) {
+      throw new Error('object.member.read requires object_ref and member_ref')
+    }
+    return fetchJson(`/api/circle/object_member?circle_id=${encodeURIComponent(effectiveCircleId)}&object_ref=${encodeURIComponent(payload.object_ref)}&member_ref=${encodeURIComponent(payload.member_ref)}`)
+  }
+  if (method === 'object.summary.read') {
+    const effectiveCircleId = requireBridgeCircleId()
+    if (!payload.object_ref) {
+      throw new Error('object.summary.read requires object_ref')
+    }
+    return fetchJson(`/api/circle/object_summary?circle_id=${encodeURIComponent(effectiveCircleId)}&object_ref=${encodeURIComponent(payload.object_ref)}`)
+  }
+  if (method === 'object.members.read') {
+    const effectiveCircleId = requireBridgeCircleId()
+    if (!payload.object_ref) {
+      throw new Error('object.members.read requires object_ref')
+    }
+    return fetchJson(`/api/circle/object_members?circle_id=${encodeURIComponent(effectiveCircleId)}&object_ref=${encodeURIComponent(payload.object_ref)}`)
+  }
+  if (method === 'object.policy.define') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/object_policy_define', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'object.bind') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/object_bind', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'object.member.attach') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/object_member_attach', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'object.member.detach') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/object_member_detach', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'object.transition.apply') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/object_transition_apply', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'balance_cell.put') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/balance_cell_put', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'register_cell.read') {
+    const effectiveCircleId = requireBridgeCircleId()
+    if (!payload.state_ref) {
+      throw new Error('register_cell.read requires state_ref')
+    }
+    return fetchJson(`/api/circle/register_cell?circle_id=${encodeURIComponent(effectiveCircleId)}&state_ref=${encodeURIComponent(payload.state_ref)}`)
+  }
+  if (method === 'register_binding.read') {
+    const effectiveCircleId = requireBridgeCircleId()
+    if (!payload.register_ref) {
+      throw new Error('register_binding.read requires register_ref')
+    }
+    return fetchJson(`/api/circle/register_binding?circle_id=${encodeURIComponent(effectiveCircleId)}&register_ref=${encodeURIComponent(payload.register_ref)}`)
+  }
+  if (method === 'register_workflow.read') {
+    const effectiveCircleId = requireBridgeCircleId()
+    if (!payload.workflow_ref) {
+      throw new Error('register_workflow.read requires workflow_ref')
+    }
+    return fetchJson(`/api/circle/register_workflow?circle_id=${encodeURIComponent(effectiveCircleId)}&workflow_ref=${encodeURIComponent(payload.workflow_ref)}`)
+  }
+  if (method === 'register_cell.put') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/register_cell_put', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'transport_policy.read') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return fetchJson(`/api/circle/transport_policy?circle_id=${encodeURIComponent(effectiveCircleId)}`)
+  }
+  if (method === 'transport_policy.put') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/transport_policy_put', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'hfhe_policy.read') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return fetchJson(`/api/circle/hfhe_policy?circle_id=${encodeURIComponent(effectiveCircleId)}`)
+  }
+  if (method === 'hfhe_policy.put') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/hfhe_policy_put', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'key_policy.read') {
+    const effectiveCircleId = requireBridgeCircleId()
+    if (!payload.key_id) {
+      throw new Error('key_policy.read requires key_id')
+    }
+    return fetchJson(`/api/circle/key_policy?circle_id=${encodeURIComponent(effectiveCircleId)}&key_id=${encodeURIComponent(payload.key_id)}`)
+  }
+  if (method === 'key_policy.put') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/key_policy_put', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'key.grant') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/key_grant', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'key.extend') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/key_extend', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'key.revoke') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/key_revoke', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'key.erase') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/key_erase', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'outbox.open') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/outbox_open', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'outbox.intent') {
+    const effectiveCircleId = requireBridgeCircleId()
+    if (!payload.intent_id) {
+      throw new Error('outbox.intent requires circle_id and intent_id')
+    }
+    return fetchJson(`/api/circle/outbox_intent?circle_id=${encodeURIComponent(effectiveCircleId)}&intent_id=${encodeURIComponent(payload.intent_id)}`)
+  }
+  if (method === 'outbox.claim') {
+    const effectiveCircleId = requireBridgeCircleId()
+    if (!payload.intent_id) {
+      throw new Error('outbox.claim requires circle_id and intent_id')
+    }
+    return fetchJson(`/api/circle/outbox_claim?circle_id=${encodeURIComponent(effectiveCircleId)}&intent_id=${encodeURIComponent(payload.intent_id)}`)
+  }
+  if (method === 'outbox.status') {
+    const effectiveCircleId = requireBridgeCircleId()
+    if (!payload.intent_id) {
+      throw new Error('outbox.status requires circle_id and intent_id')
+    }
+    return fetchJson(`/api/circle/outbox_status?circle_id=${encodeURIComponent(effectiveCircleId)}&intent_id=${encodeURIComponent(payload.intent_id)}`)
+  }
+  if (method === 'relay.claim') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/relay_claim', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'relay.cancel') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/relay_cancel', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'ingress.commit') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/ingress_commit', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'ingress.packet') {
+    const effectiveCircleId = requireBridgeCircleId()
+    if (!payload.intent_id) {
+      throw new Error('ingress.packet requires circle_id and intent_id')
+    }
+    return fetchJson(`/api/circle/ingress_packet?circle_id=${encodeURIComponent(effectiveCircleId)}&intent_id=${encodeURIComponent(payload.intent_id)}`)
+  }
   if (method === 'wallet.info') {
     return fetchJson('/api/wallet')
   }
@@ -883,11 +1368,76 @@ const bridgeResultOf = async (method, payload = {}) => {
   if (method === 'wallet.keys') {
     return fetchJson('/api/keys')
   }
+  if (method === 'wallet.send') {
+    return postJson('/api/send', payload)
+  }
+  if (method === 'fhe.load_pk') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/fhe/load_pk', { ...payload, circle_id: effectiveCircleId })
+  }
   if (method === 'fhe.encrypt') {
-    return postJson('/api/fhe/encrypt', payload)
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/fhe/encrypt', { ...payload, circle_id: effectiveCircleId })
   }
   if (method === 'fhe.decrypt') {
-    return postJson('/api/fhe/decrypt', payload)
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/fhe/decrypt', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'fhe.commit') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/fhe/commit', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'fhe.pedersen') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/fhe/pedersen', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'fhe.serialize_cipher') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/fhe/serialize_cipher', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'fhe.deserialize_cipher') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/fhe/deserialize_cipher', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'fhe.verify_zero') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/fhe/verify_zero', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'fhe.verify_range') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/fhe/verify_range', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'fhe.verify_bound') {
+    const effectiveCircleId = requireBridgeCircleId()
+    return postJson('/api/circle/fhe/verify_bound', { ...payload, circle_id: effectiveCircleId })
+  }
+  if (method === 'relay.request') {
+    return postJson('/api/relay/request', payload)
+  }
+  if (method === 'relay.status') {
+    const suffix = payload.request_id ? `?request_id=${encodeURIComponent(payload.request_id)}` : ''
+    return fetchJson(`/api/relay/status${suffix}`)
+  }
+  if (method === 'relay.response') {
+    if (!payload.request_id) {
+      throw new Error('relay.response requires request_id')
+    }
+    return fetchJson(`/api/relay/response?request_id=${encodeURIComponent(payload.request_id)}`)
+  }
+  if (method === 'relay.receipt') {
+    if (!payload.request_id) {
+      throw new Error('relay.receipt requires request_id')
+    }
+    return fetchJson(`/api/relay/receipt?request_id=${encodeURIComponent(payload.request_id)}`)
+  }
+  if (method === 'relay.ingress') {
+    if (!payload.request_id) {
+      throw new Error('relay.ingress requires request_id')
+    }
+    return fetchJson(`/api/relay/ingress?request_id=${encodeURIComponent(payload.request_id)}`)
+  }
+  if (method === 'relay.health') {
+    return fetchJson('/api/relay/health')
   }
   throw new Error(`unsupported bridge method: ${method}`)
 }
@@ -931,6 +1481,9 @@ const padTargetBytes = (paddingClass) => {
   return 0
 }
 
+const circleAssetMaxRawBytes = 33554432
+const circleAssetMaxB64Bytes = Math.ceil(circleAssetMaxRawBytes / 3) * 4
+
 const paddedFrame = (plaintextBytes, paddingClass) => {
   const bare = mergeBytes(u32be(plaintextBytes.length), plaintextBytes)
   const target = padTargetBytes(paddingClass)
@@ -938,6 +1491,20 @@ const paddedFrame = (plaintextBytes, paddingClass) => {
   const aligned = Math.ceil(bare.length / target) * target
   if (aligned <= bare.length) return bare
   return mergeBytes(bare, randomBytes(aligned - bare.length))
+}
+
+const circleAssetDecodedSizeUpperBound = wireLen => Math.ceil(wireLen / 4) * 3
+
+const circleAssetFeeOfCiphertextB64 = ciphertextB64 => {
+  const rawUpperBound = circleAssetDecodedSizeUpperBound(ciphertextB64.length)
+  if (rawUpperBound <= 4096) return 5000
+  if (rawUpperBound <= 16384) return 10000
+  if (rawUpperBound <= 32768) return 20000
+  if (rawUpperBound <= 131072) return 40000
+  if (rawUpperBound <= 524288) return 80000
+  if (rawUpperBound <= 2097152) return 160000
+  if (rawUpperBound <= 8388608) return 320000
+  return 640000
 }
 
 const deriveReadKey = async (circleId, keyId, passphrase) => {
@@ -1008,9 +1575,9 @@ const makeDataUrl = (contentType, bytes) => `data:${contentType};base64,${bytesT
 
 const loadPlainAsset = async (circleId, path) => fetchJson(`/api/circle/asset?circle_id=${encodeURIComponent(circleId)}&path=${encodeURIComponent(normalizeAssetPath(path))}`)
 
-const loadSealedAsset = async (circleId, path, passphrase) => {
+const loadSealedAsset = async (circleId, path, passphrase, versionToken = '') => {
   const normalizedPath = normalizeAssetPath(path)
-  const cacheKey = `${circleId}:${normalizedPath}:${passphrase}`
+  const cacheKey = `${circleId}:${versionToken}:${normalizedPath}:${passphrase}`
   if (!decryptedCache.has(cacheKey)) {
     decryptedCache.set(cacheKey, (async () => {
       const resourceKey = await resourceKeyOfPath(circleId, normalizedPath)
@@ -1018,6 +1585,7 @@ const loadSealedAsset = async (circleId, path, passphrase) => {
       const bytes = await decryptSealedBytes(circleId, asset, passphrase)
       return {
         ...asset,
+        canonical_path: asset.canonical_path || normalizedPath,
         bytes,
         text: isTextContent(asset.content_type) ? bytesToText(bytes) : ''
       }
@@ -1041,7 +1609,7 @@ const prependHeadMeta = (doc, name, value, attrName) => {
   head.prepend(meta)
 }
 
-const materializeCss = async (circleId, cssPath, cssText, passphrase, seen = new Set()) => {
+const materializeCss = async (circleId, cssPath, cssText, passphrase, versionToken = '', seen = new Set()) => {
   const cssKey = `${circleId}:${cssPath}`
   if (seen.has(cssKey)) return ''
   const nextSeen = new Set(seen)
@@ -1056,8 +1624,8 @@ const materializeCss = async (circleId, cssPath, cssText, passphrase, seen = new
       : await (async () => {
           const resolved = resolveCirclePath(cssPath, source)
           if (!resolved || isDataSpec(resolved) || isBlockedRemoteSpec(resolved)) return ''
-          const imported = await loadSealedAsset(circleId, resolved, passphrase)
-          return await materializeCss(circleId, resolved, imported.text, passphrase, nextSeen)
+          const imported = await loadSealedAsset(circleId, resolved, passphrase, versionToken)
+          return await materializeCss(circleId, resolved, imported.text, passphrase, versionToken, nextSeen)
         })()
     result = `${result.slice(0, importMatch.index)}${replacement}${result.slice(importMatch.index + importMatch[0].length)}`
     importRegex.lastIndex = 0
@@ -1074,7 +1642,7 @@ const materializeCss = async (circleId, cssPath, cssText, passphrase, seen = new
       if (!resolved || isBlockedRemoteSpec(resolved)) {
         replacement = 'url("data:,")'
       } else {
-        const asset = await loadSealedAsset(circleId, resolved, passphrase)
+        const asset = await loadSealedAsset(circleId, resolved, passphrase, versionToken)
         replacement = `url("${makeDataUrl(asset.content_type, asset.bytes)}")`
       }
     }
@@ -1333,13 +1901,13 @@ const rewriteInternalAnchor = (circleId, basePath, href) => {
   return circleUriOf(circleId, resolved)
 }
 
-const materializeSealedHtml = async (circleId, htmlPath, htmlText, passphrase, bridgeToken) => {
+const materializeSealedHtml = async (circleId, htmlPath, htmlText, passphrase, bridgeToken, versionToken = '') => {
   const doc = new DOMParser().parseFromString(htmlText, 'text/html')
   injectSealedPolicy(doc)
   installSealedPrelude(doc, circleId, htmlPath, bridgeToken)
   const inlineStyles = Array.from(doc.querySelectorAll('style'))
   for (const node of inlineStyles) {
-    node.textContent = await materializeCss(circleId, htmlPath, node.textContent || '', passphrase)
+    node.textContent = await materializeCss(circleId, htmlPath, node.textContent || '', passphrase, versionToken)
   }
   const styleLinks = Array.from(doc.querySelectorAll('link[href]'))
   for (const node of styleLinks) {
@@ -1353,9 +1921,9 @@ const materializeSealedHtml = async (circleId, htmlPath, htmlText, passphrase, b
         if (!resolved || isBlockedRemoteSpec(resolved)) {
           node.remove()
         } else {
-          const asset = await loadSealedAsset(circleId, resolved, passphrase)
+          const asset = await loadSealedAsset(circleId, resolved, passphrase, versionToken)
           const style = doc.createElement('style')
-          style.textContent = await materializeCss(circleId, resolved, asset.text, passphrase)
+          style.textContent = await materializeCss(circleId, resolved, asset.text, passphrase, versionToken)
           node.replaceWith(style)
         }
       }
@@ -1364,7 +1932,7 @@ const materializeSealedHtml = async (circleId, htmlPath, htmlText, passphrase, b
     } else if (!isDataSpec(href)) {
       const resolved = resolveCirclePath(htmlPath, href)
       if (resolved) {
-        const asset = await loadSealedAsset(circleId, resolved, passphrase)
+        const asset = await loadSealedAsset(circleId, resolved, passphrase, versionToken)
         node.setAttribute('href', makeDataUrl(asset.content_type, asset.bytes))
       }
     }
@@ -1375,14 +1943,14 @@ const materializeSealedHtml = async (circleId, htmlPath, htmlText, passphrase, b
     if (isBlockedRemoteSpec(src)) {
       node.remove()
     } else {
-      const resolved = resolveCirclePath(htmlPath, src)
-      if (!resolved || isBlockedRemoteSpec(resolved)) {
-        node.remove()
-      } else {
-        const asset = await loadSealedAsset(circleId, resolved, passphrase)
-        const inline = doc.createElement('script')
-        inline.textContent = asset.text
-        node.replaceWith(inline)
+        const resolved = resolveCirclePath(htmlPath, src)
+        if (!resolved || isBlockedRemoteSpec(resolved)) {
+          node.remove()
+        } else {
+          const asset = await loadSealedAsset(circleId, resolved, passphrase, versionToken)
+          const inline = doc.createElement('script')
+          inline.textContent = asset.text
+          node.replaceWith(inline)
       }
     }
   }
@@ -1397,7 +1965,7 @@ const materializeSealedHtml = async (circleId, htmlPath, htmlText, passphrase, b
     } else if (!isDataSpec(src)) {
       const resolved = resolveCirclePath(htmlPath, src)
       if (resolved && !isBlockedRemoteSpec(resolved)) {
-        const asset = await loadSealedAsset(circleId, resolved, passphrase)
+        const asset = await loadSealedAsset(circleId, resolved, passphrase, versionToken)
         node.setAttribute('src', makeDataUrl(asset.content_type, asset.bytes))
       }
     }
@@ -1410,7 +1978,7 @@ const materializeSealedHtml = async (circleId, htmlPath, htmlText, passphrase, b
     } else if (!isDataSpec(poster)) {
       const resolved = resolveCirclePath(htmlPath, poster)
       if (resolved && !isBlockedRemoteSpec(resolved)) {
-        const asset = await loadSealedAsset(circleId, resolved, passphrase)
+        const asset = await loadSealedAsset(circleId, resolved, passphrase, versionToken)
         node.setAttribute('poster', makeDataUrl(asset.content_type, asset.bytes))
       }
     }
@@ -1454,7 +2022,8 @@ const renderPublicAsset = (asset) => {
 }
 
 const renderSealedAsset = async (circleId, path, info, passphrase) => {
-  const asset = await loadSealedAsset(circleId, path, passphrase)
+  const versionToken = info.assets_root || info.stable_root || ''
+  const asset = await loadSealedAsset(circleId, path, passphrase, versionToken)
   setPreviewExpandAvailable(true)
   $('preview-head').textContent = `oct://${circleId}${asset.canonical_path} | sealed_read | ${asset.content_type} | key_id=${asset.key_id || 'none'}`
   const body = $('preview-body')
@@ -1470,7 +2039,7 @@ const renderSealedAsset = async (circleId, path, info, passphrase) => {
         activeBridgeWindow = frame.contentWindow
       }
     })
-    frame.srcdoc = await materializeSealedHtml(circleId, asset.canonical_path, asset.text, passphrase, bridgeToken)
+    frame.srcdoc = await materializeSealedHtml(circleId, asset.canonical_path, asset.text, passphrase, bridgeToken, versionToken)
     activeBridgeContext = {
       circle_id: circleId,
       path: asset.canonical_path,
@@ -1585,7 +2154,11 @@ const uploadSealedAsset = async () => {
   try {
     const plaintext = new Uint8Array(await file.arrayBuffer())
     const sealed = await encryptSealedBytes(circleId, keyId, passphrase, plaintext, paddingClass)
-    setStatus('upload-status', 'submitting tx...', false)
+    if (sealed.ciphertext_b64.length > circleAssetMaxB64Bytes) {
+      throw new Error('sealed asset exceeds 32mb circle limit')
+    }
+    const uploadOu = String(circleAssetFeeOfCiphertextB64(sealed.ciphertext_b64))
+    setStatus('upload-status', `submitting tx | ou ${uploadOu}`, false)
     const result = await postJson('/api/circle/asset_encrypted', {
       circle_id: circleId,
       path,
@@ -1595,7 +2168,7 @@ const uploadSealedAsset = async () => {
       plaintext_hash: sealed.plaintext_hash,
       padding_class: paddingClass,
       ciphertext_b64: sealed.ciphertext_b64,
-      ou: '5000'
+      ou: uploadOu
     })
     decryptedCache.clear()
     setStatus('upload-status', `submitted ${result.tx_hash || 'tx'}`, false)
