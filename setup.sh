@@ -7,8 +7,8 @@ for arg in "$@"; do
         --deps-only|--no-build) MODE="deps" ;;
         --help|-h)
             echo "usage: $0 [--deps-only]"
-            echo "  (no args)     install deps + build"
-            echo "  --deps-only   install deps only (no make)"
+            echo "(no args) install deps + build"
+            echo "--deps-only install deps only (no make)"
             exit 0
             ;;
     esac
@@ -38,14 +38,33 @@ case "$OS" in
                 eval "$(/usr/local/bin/brew shellenv)"
             fi
         fi
-        for pkg in openssl@3 leveldb; do
-            if ! brew list $pkg &>/dev/null; then
+        ensure_brew_formula() {
+            local pkg="$1"
+            local check_path="$2"
+            if ! brew list --versions "$pkg" &>/dev/null; then
                 echo "installing $pkg..."
-                brew install $pkg
+                brew install "$pkg"
             else
                 echo "$pkg already installed"
             fi
-        done
+            if [ ! -e "$check_path" ]; then
+                echo "$pkg looks incomplete or broken (missing $check_path)"
+                echo "reinstalling $pkg..."
+                brew reinstall "$pkg"
+            fi
+            if [ ! -e "$check_path" ]; then
+                echo "error: $pkg is still incomplete after reinstall"
+                echo "expected file: $check_path"
+                exit 1
+            fi
+        }
+        OPENSSL_PREFIX="$(brew --prefix openssl@3 2>/dev/null || true)"
+        [ -n "$OPENSSL_PREFIX" ] || OPENSSL_PREFIX="/opt/homebrew/opt/openssl@3"
+        LEVELDB_PREFIX="$(brew --prefix leveldb 2>/dev/null || true)"
+        [ -n "$LEVELDB_PREFIX" ] || LEVELDB_PREFIX="/opt/homebrew/opt/leveldb"
+        ensure_brew_formula "openssl@3" "$OPENSSL_PREFIX/lib/libssl.3.dylib"
+        ensure_brew_formula "leveldb" "$LEVELDB_PREFIX/lib/libleveldb.1.dylib"
+        brew postinstall openssl@3 >/dev/null 2>&1 || true
         if ! xcode-select -p &>/dev/null; then
             echo "installing Xcode command line tools..."
             xcode-select --install 2>/dev/null || true

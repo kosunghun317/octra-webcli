@@ -62,6 +62,7 @@ extern "C" {
 #include "crypto_utils.hpp"
 #include "wallet.hpp"
 #include "rpc_client.hpp"
+#include "lib/circle_hfhe_receipt.hpp"
 #include "lib/tx_builder.hpp"
 #include "lib/pvac_bridge.hpp"
 #include "lib/stealth.hpp"
@@ -122,6 +123,37 @@ static std::string current_public_rpc_url() {
     const char* env_rpc = std::getenv("OCTRA_RPC_URL");
     if (env_rpc && *env_rpc) return env_rpc;
     return "http://127.0.0.1:8080";
+}
+
+struct RelayProxyResult {
+    bool ok = false;
+    int status = 0;
+    std::string body;
+    std::string error;
+};
+
+static std::string current_circle_relayer_url() {
+    const char* env_relayer = std::getenv("OCTRA_CIRCLE_RELAYER_URL");
+    if (env_relayer && *env_relayer) return env_relayer;
+    return "http://127.0.0.1:9494";
+}
+
+static RelayProxyResult relay_http_get(const std::string& path) {
+    httplib::Client cli(current_circle_relayer_url());
+    cli.set_connection_timeout(5, 0);
+    cli.set_read_timeout(30, 0);
+    auto r = cli.Get(path.c_str());
+    if (!r) return {false, 502, "", "relay unavailable"};
+    return {true, r->status, r->body, ""};
+}
+
+static RelayProxyResult relay_http_post(const std::string& path, const std::string& body) {
+    httplib::Client cli(current_circle_relayer_url());
+    cli.set_connection_timeout(5, 0);
+    cli.set_read_timeout(30, 0);
+    auto r = cli.Post(path.c_str(), body, "application/json");
+    if (!r) return {false, 502, "", "relay unavailable"};
+    return {true, r->status, r->body, ""};
 }
 
 static void pk_cache_put(const std::string& addr, const std::vector<uint8_t>& pk) {
@@ -275,6 +307,25 @@ static std::string parse_ou(const json& body, const std::string& fallback) {
     return fallback;
 }
 
+static constexpr size_t CIRCLE_ASSET_MAX_RAW_BYTES = 33554432;
+static constexpr size_t CIRCLE_ASSET_MAX_B64_BYTES = ((CIRCLE_ASSET_MAX_RAW_BYTES + 2) / 3) * 4;
+
+static size_t circle_asset_decoded_size_upper_bound(size_t wire_len) {
+    return ((wire_len + 3) / 4) * 3;
+}
+
+static int64_t circle_asset_ou_from_b64_len(size_t wire_len) {
+    const size_t raw_upper_bound = circle_asset_decoded_size_upper_bound(wire_len);
+    if (raw_upper_bound <= 4096) return 5000;
+    if (raw_upper_bound <= 16384) return 10000;
+    if (raw_upper_bound <= 32768) return 20000;
+    if (raw_upper_bound <= 131072) return 40000;
+    if (raw_upper_bound <= 524288) return 80000;
+    if (raw_upper_bound <= 2097152) return 160000;
+    if (raw_upper_bound <= 8388608) return 320000;
+    return 640000;
+}
+
 static const int64_t MAX_OCT_RAW = 1000000000LL * 1000000LL;
 
 static int64_t parse_amount_raw(const json& body) {
@@ -346,6 +397,472 @@ static void sign_tx_fields(octra::Transaction& tx) {
     tx.public_key = g_wallet.pub_b64;
 }
 
+static std::string sign_circle_read_request(const std::string& op,
+                                            const std::string& circle_id,
+                                            const std::string& subject = "") {
+    return octra::sign_circle_read_request(
+        op,
+        circle_id,
+        g_wallet.addr,
+        subject,
+        g_wallet.sk);
+}
+
+static std::string sign_circle_view_request(const std::string& circle_id,
+                                            const std::string& method,
+                                            const json& params,
+                                            bool include_storage) {
+    const std::string params_hash = octra::sha256_hex(params.dump());
+    const std::string subject =
+        method + "|" + params_hash + "|" + (include_storage ? "1" : "0");
+    return sign_circle_read_request("octra_circle_view", circle_id, subject);
+}
+
+static octra::RpcResult circle_info_auth_rpc(const std::string& circle_id) {
+    octra::RpcClient rpc(current_public_rpc_url());
+    return rpc.circle_info_auth(
+        circle_id,
+        g_wallet.addr,
+        g_wallet.pub_b64,
+        sign_circle_read_request("octra_circle_info", circle_id));
+}
+
+static octra::RpcResult circle_hfhe_policy_auth_rpc(const std::string& circle_id) {
+    octra::RpcClient rpc(current_public_rpc_url());
+    return rpc.circle_hfhe_policy_auth(
+        circle_id,
+        g_wallet.addr,
+        g_wallet.pub_b64,
+        sign_circle_read_request("octra_circle_hfhe_policy", circle_id));
+}
+
+static octra::RpcResult circle_key_policy_auth_rpc(const std::string& circle_id,
+                                                   const std::string& key_id) {
+    octra::RpcClient rpc(current_public_rpc_url());
+    return rpc.circle_key_policy_auth(
+        circle_id,
+        key_id,
+        g_wallet.addr,
+        g_wallet.pub_b64,
+        sign_circle_read_request("octra_circle_key_policy", circle_id, key_id));
+}
+
+static octra::RpcResult circle_outbox_status_auth_rpc(const std::string& circle_id,
+                                                      const std::string& intent_id) {
+    octra::RpcClient rpc(current_public_rpc_url());
+    return rpc.circle_outbox_status_auth(
+        circle_id,
+        intent_id,
+        g_wallet.addr,
+        g_wallet.pub_b64,
+        sign_circle_read_request("octra_circle_outbox_status", circle_id, intent_id));
+}
+
+static bool circle_string_list_contains(const json& values, const std::string& target) {
+    if (!values.is_array()) return false;
+    for (const auto& value : values) {
+        if (value.is_string() && value.get<std::string>() == target) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool circle_hfhe_mode_allows(const std::string& mode,
+                                    const std::string& owner,
+                                    const std::string& caller,
+                                    const std::string& subject,
+                                    const std::vector<std::string>& active_relays) {
+    const bool caller_is_active_relay =
+        std::find(active_relays.begin(), active_relays.end(), caller) != active_relays.end();
+    if (mode == "deny") return false;
+    if (mode == "owner_only") return caller == owner;
+    if (mode == "caller_self") return caller == subject;
+    if (mode == "owner_or_caller") return caller == owner || caller == subject;
+    if (mode == "any_registered") return !caller.empty();
+    if (mode == "active_relay") return caller_is_active_relay;
+    if (mode == "owner_or_active_relay") return caller == owner || caller_is_active_relay;
+    return false;
+}
+
+static bool circle_hfhe_pk_allowed(const json& policy, const std::string& requested_addr) {
+    if (!policy.contains("pk_allowlist") || policy["pk_allowlist"].is_null()) {
+        return true;
+    }
+    return circle_string_list_contains(policy["pk_allowlist"], requested_addr);
+}
+
+static bool circle_key_policy_live(const std::string& circle_id,
+                                   const std::string& key_id,
+                                   std::string& error) {
+    auto r = circle_key_policy_auth_rpc(circle_id, key_id);
+    if (!r.ok) {
+        error = r.error.empty() ? "circle key policy read failed" : r.error;
+        return false;
+    }
+    if (!r.result.contains("live") || !r.result["live"].is_boolean()) {
+        error = "circle key policy live status unavailable";
+        return false;
+    }
+    if (!r.result["live"].get<bool>()) {
+        error = "circle key policy is not live";
+        return false;
+    }
+    return true;
+}
+
+static bool circle_hfhe_active_relays(const std::string& circle_id,
+                                      const std::string& intent_id,
+                                      std::vector<std::string>& active_relays,
+                                      std::string& error) {
+    auto status_r = circle_outbox_status_auth_rpc(circle_id, intent_id);
+    if (!status_r.ok) {
+        error = status_r.error.empty() ? "circle outbox status read failed" : status_r.error;
+        return false;
+    }
+    if (status_r.result.value("status", "") != "claimed") {
+        error = "circle outbox intent is not actively claimed";
+        return false;
+    }
+    if (!status_r.result.value("claim_ready", false)) {
+        error = "circle outbox intent relay quorum is not ready";
+        return false;
+    }
+    active_relays.clear();
+    const auto active_claims = status_r.result.value("active_claims", json::array());
+    for (const auto& claim : active_claims) {
+        if (claim.is_object()) {
+            const std::string relay_id = claim.value("relay_id", "");
+            if (!relay_id.empty()) {
+                active_relays.push_back(relay_id);
+            }
+        }
+    }
+    if (active_relays.empty()) {
+        error = "circle outbox active relays are unavailable";
+        return false;
+    }
+    return true;
+}
+
+static bool circle_hfhe_authorize(const std::string& circle_id,
+                                  const std::string& mode_key,
+                                  const std::string& requested_addr,
+                                  const std::string& key_id,
+                                  const std::string& intent_id,
+                                  std::string& error) {
+    auto info_r = circle_info_auth_rpc(circle_id);
+    if (!info_r.ok) {
+        error = info_r.error.empty() ? "circle info read failed" : info_r.error;
+        return false;
+    }
+    auto policy_r = circle_hfhe_policy_auth_rpc(circle_id);
+    if (!policy_r.ok) {
+        error = policy_r.error.empty() ? "circle hfhe policy read failed" : policy_r.error;
+        return false;
+    }
+    json policy = policy_r.result.value("policy", json::object());
+    if (mode_key == "load_pk_mode" && !circle_hfhe_pk_allowed(policy, requested_addr)) {
+        error = "requested pubkey address is not allowed by circle hfhe policy";
+        return false;
+    }
+    const std::string owner = info_r.result.value("owner", "");
+    const std::string default_mode =
+        mode_key == "load_pk_mode" ? "caller_self" : "owner_only";
+    const std::string mode = policy.value(mode_key, default_mode);
+    std::vector<std::string> active_relays;
+    if (mode == "active_relay" || mode == "owner_or_active_relay") {
+        if (intent_id.empty()) {
+            error = "intent_id required by circle hfhe relay-scoped policy";
+            return false;
+        }
+        if (!circle_hfhe_active_relays(circle_id, intent_id, active_relays, error)) {
+            return false;
+        }
+    }
+    const std::string subject =
+        mode_key == "load_pk_mode" ? requested_addr : g_wallet.addr;
+    if (!circle_hfhe_mode_allows(mode, owner, g_wallet.addr, subject, active_relays)) {
+        error = "circle hfhe policy denied this operation";
+        return false;
+    }
+    const bool require_live_key_policy = policy.value("require_live_key_policy", true);
+    if (require_live_key_policy) {
+        if (key_id.empty()) {
+            error = "key_id required by circle hfhe policy";
+            return false;
+        }
+        if (!circle_key_policy_live(circle_id, key_id, error)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool circle_decode_zero_proof(const std::string& encoded,
+                                     pvac_zero_proof& proof,
+                                     std::string& error) {
+    proof = nullptr;
+    if (encoded.rfind(octra::ZKZP_PREFIX, 0) != 0) {
+        error = "invalid zero proof prefix";
+        return false;
+    }
+    auto raw = octra::base64_decode(encoded.substr(std::strlen(octra::ZKZP_PREFIX)));
+    if (raw.empty()) {
+        error = "invalid zero proof encoding";
+        return false;
+    }
+    proof = pvac_deserialize_zero_proof(raw.data(), raw.size());
+    if (!proof) {
+        error = "invalid zero proof";
+        return false;
+    }
+    return true;
+}
+
+static bool circle_verify_zero_with_wallet(const std::string& ciphertext_b64,
+                                           const std::string& zero_proof_b64,
+                                           std::string& error) {
+    auto raw = octra::base64_decode(ciphertext_b64);
+    if (raw.empty()) {
+        error = "invalid ciphertext";
+        return false;
+    }
+    pvac_cipher ct = g_pvac.deserialize_cipher(raw.data(), raw.size());
+    if (!ct) {
+        error = "invalid ciphertext";
+        return false;
+    }
+    pvac_zero_proof proof = nullptr;
+    if (!circle_decode_zero_proof(zero_proof_b64, proof, error)) {
+        g_pvac.free_cipher(ct);
+        return false;
+    }
+    bool ok = pvac_verify_zero(g_pvac.pk(), ct, proof) != 0;
+    pvac_free_zero_proof(proof);
+    g_pvac.free_cipher(ct);
+    if (!ok) error = "zero proof verification failed";
+    return ok;
+}
+
+static bool circle_verify_bound_with_wallet(const std::string& ciphertext_b64,
+                                            const std::string& zero_proof_b64,
+                                            const std::string& amount_commitment_b64,
+                                            std::string& error) {
+    auto raw = octra::base64_decode(ciphertext_b64);
+    if (raw.empty()) {
+        error = "invalid ciphertext";
+        return false;
+    }
+    auto commitment = octra::base64_decode(amount_commitment_b64);
+    if (commitment.size() != 32) {
+        error = "invalid amount commitment";
+        return false;
+    }
+    pvac_cipher ct = g_pvac.deserialize_cipher(raw.data(), raw.size());
+    if (!ct) {
+        error = "invalid ciphertext";
+        return false;
+    }
+    pvac_zero_proof proof = nullptr;
+    if (!circle_decode_zero_proof(zero_proof_b64, proof, error)) {
+        g_pvac.free_cipher(ct);
+        return false;
+    }
+    bool ok = pvac_verify_zero_bound(g_pvac.pk(), ct, proof, commitment.data()) != 0;
+    pvac_free_zero_proof(proof);
+    g_pvac.free_cipher(ct);
+    if (!ok) error = "bound proof verification failed";
+    return ok;
+}
+
+static bool circle_verify_range_with_wallet(const std::string& ciphertext_b64,
+                                            const std::string& range_proof_b64,
+                                            std::string& error) {
+    if (ciphertext_b64.rfind(octra::HFHE_PREFIX, 0) != 0) {
+        error = "invalid ciphertext";
+        return false;
+    }
+    if (range_proof_b64.rfind(octra::RP_PREFIX, 0) != 0) {
+        error = "invalid range proof";
+        return false;
+    }
+    auto raw = octra::base64_decode(ciphertext_b64.substr(strlen(octra::HFHE_PREFIX)));
+    if (raw.empty()) {
+        error = "invalid ciphertext";
+        return false;
+    }
+    auto proof_raw = octra::base64_decode(range_proof_b64.substr(strlen(octra::RP_PREFIX)));
+    if (proof_raw.empty()) {
+        error = "invalid range proof";
+        return false;
+    }
+    pvac_cipher ct = g_pvac.deserialize_cipher(raw.data(), raw.size());
+    if (!ct) {
+        error = "invalid ciphertext";
+        return false;
+    }
+    bool ok = pvac_verify_range_any(g_pvac.pk(), ct, proof_raw.data(), proof_raw.size()) != 0;
+    g_pvac.free_cipher(ct);
+    if (!ok) error = "range proof verification failed";
+    return ok;
+}
+
+static std::string circle_hfhe_policy_hash(const json& policy) {
+    return octra::sha256_hex(policy.dump());
+}
+
+static std::string circle_hfhe_receipt_class_value(const json& policy) {
+    std::string receipt_class = policy.value("proof_receipt_class", "");
+    if (!receipt_class.empty()) {
+        return receipt_class;
+    }
+    if (policy.value("require_receipt_transport_binding", false)) {
+        return "transport_bound";
+    }
+    return "detached";
+}
+
+static bool circle_hfhe_receipt_required(const std::string& proof_kind) {
+    return proof_kind == "zero_receipt_v1" ||
+           proof_kind == "range_receipt_v1" ||
+           proof_kind == "bound_zero_receipt_v1";
+}
+
+static bool circle_hfhe_proof_requires_commitment(const std::string& proof_kind) {
+    return proof_kind == "bound_zero_v1" || proof_kind == "bound_zero_receipt_v1";
+}
+
+static bool circle_hfhe_proof_is_range(const std::string& proof_kind) {
+    return proof_kind == "range_v1" || proof_kind == "range_receipt_v1";
+}
+
+static bool circle_hfhe_receipt_transport_bound(const json& policy,
+                                                const std::string& intent_id,
+                                                std::string& error) {
+    const std::string receipt_class = circle_hfhe_receipt_class_value(policy);
+    if ((receipt_class == "transport_bound" || receipt_class == "relay_witnessed") &&
+        intent_id.empty()) {
+        error = "intent_id required by circle hfhe receipt binding policy";
+        return false;
+    }
+    return true;
+}
+
+static bool circle_hfhe_receipt_signer_allowed(const std::string& circle_id,
+                                               const json& policy,
+                                               const std::string& caller_addr,
+                                               const std::string& signer_addr,
+                                               const std::string& intent_id,
+                                               std::string& error) {
+    auto info_r = circle_info_auth_rpc(circle_id);
+    if (!info_r.ok) {
+        error = info_r.error.empty() ? "circle info read failed" : info_r.error;
+        return false;
+    }
+    const std::string owner = info_r.result.value("owner", "");
+    const std::string mode = policy.value("proof_receipt_signer_mode", "caller_self");
+    const std::string receipt_class = circle_hfhe_receipt_class_value(policy);
+    std::vector<std::string> active_relays;
+    if (mode == "active_relay" || mode == "owner_or_active_relay" ||
+        receipt_class == "relay_witnessed") {
+        if (intent_id.empty()) {
+            error = "intent_id required by circle hfhe receipt signer policy";
+            return false;
+        }
+        if (!circle_hfhe_active_relays(circle_id, intent_id, active_relays, error)) {
+            return false;
+        }
+    }
+    if (receipt_class == "relay_witnessed" &&
+        std::find(active_relays.begin(), active_relays.end(), signer_addr) == active_relays.end()) {
+        error = "circle hfhe receipt signer must be an active relay";
+        return false;
+    }
+    if (!circle_hfhe_mode_allows(mode, owner, signer_addr, caller_addr, active_relays)) {
+        error = "circle hfhe receipt signer is not allowed by policy";
+        return false;
+    }
+    return true;
+}
+
+static bool circle_hfhe_receipt_context(const std::string& circle_id,
+                                        const std::string& verb,
+                                        const std::string& caller_addr,
+                                        const std::string& key_id,
+                                        const std::string& intent_id,
+                                        const std::string& proof_kind,
+                                        const json& policy,
+                                        const std::string& ciphertext_b64,
+                                        const std::string& amount_commitment_b64,
+                                        octra::CircleHfheReceiptContext& ctx,
+                                        std::string& error) {
+    if (!circle_hfhe_receipt_transport_bound(policy, intent_id, error)) {
+        return false;
+    }
+    std::string ciphertext_hash = octra::circle_hfhe_hash_ciphertext(ciphertext_b64, error);
+    if (ciphertext_hash.empty()) {
+        return false;
+    }
+    std::string amount_commitment_hash;
+    if (!amount_commitment_b64.empty()) {
+        amount_commitment_hash = octra::circle_hfhe_hash_commitment(amount_commitment_b64, error);
+        if (amount_commitment_hash.empty()) {
+            return false;
+        }
+    }
+    ctx = {
+        circle_id,
+        caller_addr,
+        key_id,
+        intent_id,
+        verb,
+        proof_kind,
+        circle_hfhe_policy_hash(policy),
+        ciphertext_hash,
+        amount_commitment_hash
+    };
+    return true;
+}
+
+static bool circle_verify_proof_receipt(const std::string& circle_id,
+                                        const std::string& verb,
+                                        const std::string& caller_addr,
+                                        const std::string& key_id,
+                                        const std::string& intent_id,
+                                        const std::string& proof_kind,
+                                        const json& policy,
+                                        const std::string& ciphertext_b64,
+                                        const std::string& amount_commitment_b64,
+                                        const json& receipt,
+                                        std::string& error) {
+    octra::CircleHfheReceiptContext ctx;
+    if (!circle_hfhe_receipt_context(
+            circle_id,
+            verb,
+            caller_addr,
+            key_id,
+            intent_id,
+            proof_kind,
+            policy,
+            ciphertext_b64,
+            amount_commitment_b64,
+            ctx,
+            error)) {
+        return false;
+    }
+    if (!octra::verify_circle_hfhe_receipt_json(receipt, ctx, error)) {
+        return false;
+    }
+    return circle_hfhe_receipt_signer_allowed(
+        circle_id,
+        policy,
+        ctx.caller_addr,
+        receipt.value("signer_addr", ""),
+        ctx.intent_id,
+        error);
+}
+
 static json submit_tx(const octra::Transaction& tx) {
     json j;
     j["from"] = tx.from;
@@ -392,6 +909,27 @@ static json submit_tx(const octra::Transaction& tx) {
     return res;
 }
 
+static json submit_program_call_tx(const std::string& target,
+                                   const std::string& op_type,
+                                   const std::string& method,
+                                   const json& params,
+                                   const json& body,
+                                   const std::string& default_ou) {
+    auto bi = get_nonce_balance();
+    octra::Transaction tx;
+    tx.from = g_wallet.addr;
+    tx.to_ = target;
+    tx.amount = body.value("amount", "0");
+    tx.nonce = bi.nonce + 1;
+    tx.ou = parse_ou(body, default_ou);
+    tx.timestamp = now_ts();
+    tx.op_type = op_type;
+    tx.encrypted_data = method;
+    tx.message = params.dump();
+    sign_tx_fields(tx);
+    return submit_tx(tx);
+}
+
 static bool rpc_lookup_failed_transiently(const std::string& error) {
     return error.find("connection failed") != std::string::npos
         || error.find("parse error") != std::string::npos
@@ -429,10 +967,6 @@ static bool ensure_pubkey_registered_on(octra::RpcClient& rpc,
     }
     fprintf(stderr, "%spubkey register failed for %s: %s\n", prefix, addr.c_str(), rr.error.c_str());
     return false;
-}
-
-static void ensure_pubkey_registered(const std::string& addr, const uint8_t sk[64], const std::string& pub_b64) {
-    ensure_pubkey_registered_on(g_rpc, addr, sk, pub_b64);
 }
 
 static bool g_pvac_foreign = false;
@@ -2147,11 +2681,6 @@ int main(int argc, char** argv) {
 
     svr.Post("/api/keys/private", [](const httplib::Request& req, httplib::Response& res) {
         WALLET_GUARD
-#ifndef OCTRA_WEBCLI_ENABLE_KEY_EXPORT
-        res.status = 403;
-        res.set_content(err_json("key export is disabled in this build; rebuild with -DOCTRA_WEBCLI_ENABLE_KEY_EXPORT to enable").dump(), "application/json");
-        return;
-#else
         json body;
         try { body = json::parse(req.body); } catch (...) {
             res.status = 400;
@@ -2175,7 +2704,6 @@ int main(int argc, char** argv) {
         j["mnemonic"] = g_wallet.mnemonic;
         j["warning"] = "treat these values as plaintext secret; never paste into shared transcripts, screen-shares, or untrusted machines";
         res.set_content(j.dump(), "application/json");
-#endif
     });
 
     svr.Post("/api/contract/compile", [](const httplib::Request& req, httplib::Response& res) {
@@ -2438,6 +2966,166 @@ int main(int argc, char** argv) {
         res.set_content(result.dump(), "application/json");
     });
 
+    svr.Get("/api/program/info", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string addr = req.get_param_value("address");
+        if (circle_id.empty() && addr.empty()) {
+            res.status = 400;
+            res.set_content(err_json("address or circle_id required").dump(), "application/json");
+            return;
+        }
+        auto r = circle_id.empty()
+          ? g_rpc.vm_contract(addr)
+          : g_rpc.circle_program_info_auth(
+              circle_id,
+              g_wallet.addr,
+              g_wallet.pub_b64,
+              sign_circle_read_request("octra_circle_program_info", circle_id));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Post("/api/program/view", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string addr = body.value("address", "");
+        std::string method = body.value("method", "");
+        if ((circle_id.empty() && addr.empty()) || method.empty()) {
+            res.status = 400;
+            res.set_content(err_json("method and address or circle_id required").dump(), "application/json");
+            return;
+        }
+        json params = json::array();
+        if (body.contains("params")) params = body["params"];
+        auto r = circle_id.empty()
+          ? g_rpc.contract_call_view(addr, method, params, g_wallet.addr)
+          : g_rpc.circle_view_auth(
+              circle_id,
+              method,
+              params,
+              g_wallet.addr,
+              g_wallet.pub_b64,
+              sign_circle_view_request(circle_id, method, params, false),
+              false);
+        if (!r.ok) {
+            res.status = 400;
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Post("/api/program/call", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string addr = body.value("address", "");
+        std::string method = body.value("method", "");
+        if ((circle_id.empty() && addr.empty()) || method.empty()) {
+            res.status = 400;
+            res.set_content(err_json("method and address or circle_id required").dump(), "application/json");
+            return;
+        }
+        std::string params_str = "[]";
+        if (body.contains("params")) params_str = body["params"].dump();
+        std::string amount_str = body.value("amount", "0");
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id.empty() ? addr : circle_id;
+        tx.amount = amount_str;
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, "1000");
+        tx.timestamp = now_ts();
+        tx.op_type = circle_id.empty() ? "call" : "circle_call";
+        tx.encrypted_data = method;
+        tx.message = params_str;
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Get("/api/program/storage", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string addr = req.get_param_value("address");
+        std::string key = req.get_param_value("key");
+        bool dump = req.has_param("dump") && req.get_param_value("dump") == "1";
+        if (circle_id.empty() && (addr.empty() || key.empty())) {
+            res.status = 400;
+            res.set_content(err_json("address and key or circle_id required").dump(), "application/json");
+            return;
+        }
+        if (!circle_id.empty() && key.empty() && dump) {
+            auto r = g_rpc.circle_storage_dump_auth(
+                circle_id,
+                g_wallet.addr,
+                g_wallet.pub_b64,
+                sign_circle_read_request("octra_circle_storage_dump", circle_id));
+            if (!r.ok) {
+                res.status = 404;
+                res.set_content(err_json(r.error).dump(), "application/json");
+                return;
+            }
+            res.set_content(r.result.dump(), "application/json");
+            return;
+        }
+        if (!circle_id.empty() && key.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle storage key required unless dump=1").dump(), "application/json");
+            return;
+        }
+        auto r = circle_id.empty()
+          ? g_rpc.contract_storage(addr, key)
+          : g_rpc.circle_storage_auth(
+              circle_id,
+              key,
+              g_wallet.addr,
+              g_wallet.pub_b64,
+              sign_circle_read_request("octra_circle_storage", circle_id, key));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/program/abi", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string addr = req.get_param_value("address");
+        if (addr.empty()) {
+            res.status = 400;
+            res.set_content(err_json("address required").dump(), "application/json");
+            return;
+        }
+        auto r = g_rpc.contract_abi(addr);
+        if (!r.ok) {
+            res.status = 404;
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_content(r.result.dump(), "application/json");
+    });
+
     svr.Post("/api/bridge/signer", [](const httplib::Request& req, httplib::Response& res) {
         std::string signer_url;
         {
@@ -2476,6 +3164,93 @@ int main(int argc, char** argv) {
             res.status = 502;
             res.set_content("{\"error\":\"bridge signer unavailable\"}", "application/json");
         }
+    });
+
+    svr.Get("/api/relay/health", [](const httplib::Request&, httplib::Response& res) {
+        auto relay = relay_http_get("/health");
+        if (!relay.ok) {
+            res.status = relay.status ? relay.status : 502;
+            res.set_content(err_json(relay.error).dump(), "application/json");
+            return;
+        }
+        res.status = relay.status;
+        res.set_content(relay.body, "application/json");
+    });
+
+    svr.Get("/api/relay/status", [](const httplib::Request& req, httplib::Response& res) {
+        std::string request_id = req.get_param_value("request_id");
+        std::string path = "/status";
+        if (!request_id.empty()) path += "?request_id=" + request_id;
+        auto relay = relay_http_get(path);
+        if (!relay.ok) {
+            res.status = relay.status ? relay.status : 502;
+            res.set_content(err_json(relay.error).dump(), "application/json");
+            return;
+        }
+        res.status = relay.status;
+        res.set_content(relay.body, "application/json");
+    });
+
+    svr.Post("/api/relay/request", [](const httplib::Request& req, httplib::Response& res) {
+        auto relay = relay_http_post("/request", req.body);
+        if (!relay.ok) {
+            res.status = relay.status ? relay.status : 502;
+            res.set_content(err_json(relay.error).dump(), "application/json");
+            return;
+        }
+        res.status = relay.status;
+        res.set_content(relay.body, "application/json");
+    });
+
+    svr.Get("/api/relay/response", [](const httplib::Request& req, httplib::Response& res) {
+        std::string request_id = req.get_param_value("request_id");
+        if (request_id.empty()) {
+            res.status = 400;
+            res.set_content(err_json("request_id required").dump(), "application/json");
+            return;
+        }
+        auto relay = relay_http_get("/response/" + request_id);
+        if (!relay.ok) {
+            res.status = relay.status ? relay.status : 502;
+            res.set_content(err_json(relay.error).dump(), "application/json");
+            return;
+        }
+        res.status = relay.status;
+        res.set_content(relay.body, "application/json");
+    });
+
+    svr.Get("/api/relay/receipt", [](const httplib::Request& req, httplib::Response& res) {
+        std::string request_id = req.get_param_value("request_id");
+        if (request_id.empty()) {
+            res.status = 400;
+            res.set_content(err_json("request_id required").dump(), "application/json");
+            return;
+        }
+        auto relay = relay_http_get("/receipt/" + request_id);
+        if (!relay.ok) {
+            res.status = relay.status ? relay.status : 502;
+            res.set_content(err_json(relay.error).dump(), "application/json");
+            return;
+        }
+        res.status = relay.status;
+        res.set_content(relay.body, "application/json");
+    });
+
+    svr.Get("/api/relay/ingress", [](const httplib::Request& req, httplib::Response& res) {
+        std::string request_id = req.get_param_value("request_id");
+        if (request_id.empty()) {
+            res.status = 400;
+            res.set_content(err_json("request_id required").dump(), "application/json");
+            return;
+        }
+        auto relay = relay_http_get("/ingress/" + request_id);
+        if (!relay.ok) {
+            res.status = relay.status ? relay.status : 502;
+            res.set_content(err_json(relay.error).dump(), "application/json");
+            return;
+        }
+        res.status = relay.status;
+        res.set_content(relay.body, "application/json");
     });
 
     svr.Get("/api/contract/view", [](const httplib::Request& req, httplib::Response& res) {
@@ -2581,6 +3356,736 @@ int main(int argc, char** argv) {
         res.set_content(result.dump(), "application/json");
     });
 
+    svr.Post("/api/circle/fhe/load_pk", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        res.set_header("Access-Control-Allow-Origin", "*");
+        auto body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string requested_addr = body.value("addr", g_wallet.addr);
+        std::string key_id = body.value("key_id", "");
+        std::string intent_id = body.value("intent_id", "");
+        if (circle_id.empty() || requested_addr.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id and addr required").dump(), "application/json");
+            return;
+        }
+        std::string error;
+        if (!circle_hfhe_authorize(circle_id, "load_pk_mode", requested_addr, key_id, intent_id, error)) {
+            res.status = 403;
+            res.set_content(err_json(error).dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.get_pvac_pubkey(requested_addr);
+        if (!r.ok) {
+            res.status = 404;
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/fhe/encrypt", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (!g_pvac_ok) {
+            res.status = 500;
+            res.set_content(err_json("pvac not available").dump(), "application/json");
+            return;
+        }
+        auto body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.contains("value")) {
+            res.status = 400;
+            res.set_content(err_json("missing value").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string key_id = body.value("key_id", "");
+        std::string intent_id = body.value("intent_id", "");
+        if (circle_id.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id required").dump(), "application/json");
+            return;
+        }
+        std::string error;
+        if (!circle_hfhe_authorize(circle_id, "encrypt_mode", g_wallet.addr, key_id, intent_id, error)) {
+            res.status = 403;
+            res.set_content(err_json(error).dump(), "application/json");
+            return;
+        }
+        auto policy_r = circle_hfhe_policy_auth_rpc(circle_id);
+        if (!policy_r.ok) {
+            res.status = 400;
+            res.set_content(err_json(policy_r.error.empty() ? "circle hfhe policy read failed" : policy_r.error).dump(), "application/json");
+            return;
+        }
+        int64_t value = body["value"].get<int64_t>();
+        uint8_t seed[32];
+        octra::random_bytes(seed, 32);
+        pvac_cipher ct = g_pvac.encrypt(static_cast<uint64_t>(value), seed);
+        auto data = g_pvac.serialize_cipher(ct);
+        std::string b64 = octra::base64_encode(data.data(), data.size());
+        uint8_t blinding[32];
+        octra::random_bytes(blinding, 32);
+        auto amount_commitment = g_pvac.pedersen_commit(static_cast<uint64_t>(value), blinding);
+        std::string amount_commitment_b64 = octra::base64_encode(amount_commitment.data(), 32);
+        json result;
+        result["ciphertext"] = b64;
+        auto policy = policy_r.result.value("policy", json::object());
+        std::string encrypt_proof = policy.value("encrypt_proof", "bound_zero_v1");
+        if (encrypt_proof == "bound_zero_v1" || encrypt_proof == "bound_zero_receipt_v1") {
+            pvac_zero_proof proof =
+                g_pvac.make_zero_proof_bound(ct, static_cast<uint64_t>(value), blinding);
+            std::string zero_proof = g_pvac.encode_zero_proof(proof);
+            g_pvac.free_zero_proof(proof);
+            result["amount_commitment"] = amount_commitment_b64;
+            result["zero_proof"] = zero_proof;
+            result["proof_kind"] = encrypt_proof;
+        } else if (encrypt_proof == "range_v1" || encrypt_proof == "range_receipt_v1") {
+            pvac_range_proof proof =
+                g_pvac.make_range_proof(ct, static_cast<uint64_t>(value));
+            std::string range_proof = g_pvac.encode_range_proof(proof);
+            g_pvac.free_range_proof(proof);
+            result["range_proof"] = range_proof;
+            result["proof_kind"] = encrypt_proof;
+        } else if (encrypt_proof == "zero_receipt_v1") {
+            pvac_zero_proof proof = g_pvac.make_zero_proof(ct);
+            std::string zero_proof = g_pvac.encode_zero_proof(proof);
+            g_pvac.free_zero_proof(proof);
+            result["zero_proof"] = zero_proof;
+            result["proof_kind"] = encrypt_proof;
+        } else if (encrypt_proof == "none") {
+            result["proof_kind"] = "none";
+        } else {
+            g_pvac.free_cipher(ct);
+            res.status = 400;
+            res.set_content(err_json("unsupported circle hfhe encrypt proof policy").dump(), "application/json");
+            return;
+        }
+        g_pvac.free_cipher(ct);
+        if (circle_hfhe_receipt_required(encrypt_proof)) {
+            std::string receipt_commitment =
+                circle_hfhe_proof_requires_commitment(encrypt_proof)
+                    ? amount_commitment_b64
+                    : "";
+            octra::CircleHfheReceiptContext receipt_ctx;
+            if (!circle_hfhe_receipt_signer_allowed(
+                    circle_id,
+                    policy,
+                    g_wallet.addr,
+                    g_wallet.addr,
+                    intent_id,
+                    error)) {
+                res.status = 403;
+                res.set_content(err_json(error).dump(), "application/json");
+                return;
+            }
+            if (!circle_hfhe_receipt_context(
+                    circle_id,
+                    "encrypt",
+                    g_wallet.addr,
+                    key_id,
+                    intent_id,
+                    encrypt_proof,
+                    policy,
+                    b64,
+                    receipt_commitment,
+                    receipt_ctx,
+                    error)) {
+                res.status = 400;
+                res.set_content(err_json(error).dump(), "application/json");
+                return;
+            }
+            result["proof_receipt"] =
+                octra::make_circle_hfhe_receipt_json(
+                    receipt_ctx,
+                    g_wallet.addr,
+                    g_wallet.pub_b64,
+                    g_wallet.sk);
+        }
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/fhe/decrypt", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (!g_pvac_ok) {
+            res.status = 500;
+            res.set_content(err_json("pvac not available").dump(), "application/json");
+            return;
+        }
+        auto body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.contains("ciphertext")) {
+            res.status = 400;
+            res.set_content(err_json("missing ciphertext").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string key_id = body.value("key_id", "");
+        std::string intent_id = body.value("intent_id", "");
+        if (circle_id.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id required").dump(), "application/json");
+            return;
+        }
+        std::string error;
+        if (!circle_hfhe_authorize(circle_id, "decrypt_mode", g_wallet.addr, key_id, intent_id, error)) {
+            res.status = 403;
+            res.set_content(err_json(error).dump(), "application/json");
+            return;
+        }
+        auto policy_r = circle_hfhe_policy_auth_rpc(circle_id);
+        if (!policy_r.ok) {
+            res.status = 400;
+            res.set_content(err_json(policy_r.error.empty() ? "circle hfhe policy read failed" : policy_r.error).dump(), "application/json");
+            return;
+        }
+        auto policy = policy_r.result.value("policy", json::object());
+        std::string decrypt_proof = policy.value("decrypt_proof", "none");
+        if (decrypt_proof == "bound_zero_v1" || decrypt_proof == "bound_zero_receipt_v1") {
+            std::string zero_proof = body.value("zero_proof", "");
+            std::string amount_commitment = body.value("amount_commitment", "");
+            if (zero_proof.empty() || amount_commitment.empty()) {
+                res.status = 400;
+                res.set_content(err_json("zero_proof and amount_commitment required by circle hfhe policy").dump(), "application/json");
+                return;
+            }
+            if (!circle_verify_bound_with_wallet(body["ciphertext"].get<std::string>(), zero_proof, amount_commitment, error)) {
+                res.status = 400;
+                res.set_content(err_json(error).dump(), "application/json");
+                return;
+            }
+            if (circle_hfhe_receipt_required(decrypt_proof)) {
+                if (!body.contains("proof_receipt")) {
+                    res.status = 400;
+                    res.set_content(err_json("proof_receipt required by circle hfhe policy").dump(), "application/json");
+                    return;
+                }
+                if (!circle_verify_proof_receipt(
+                        circle_id,
+                        "encrypt",
+                        g_wallet.addr,
+                        key_id,
+                        intent_id,
+                        decrypt_proof,
+                        policy,
+                        body["ciphertext"].get<std::string>(),
+                        amount_commitment,
+                        body["proof_receipt"],
+                        error)) {
+                    res.status = 400;
+                    res.set_content(err_json(error).dump(), "application/json");
+                    return;
+                }
+            }
+        } else if (circle_hfhe_proof_is_range(decrypt_proof)) {
+            std::string range_proof = body.value("range_proof", "");
+            if (range_proof.empty()) {
+                res.status = 400;
+                res.set_content(err_json("range_proof required by circle hfhe policy").dump(), "application/json");
+                return;
+            }
+            if (!circle_verify_range_with_wallet(
+                    body["ciphertext"].get<std::string>(),
+                    range_proof,
+                    error)) {
+                res.status = 400;
+                res.set_content(err_json(error).dump(), "application/json");
+                return;
+            }
+            if (circle_hfhe_receipt_required(decrypt_proof)) {
+                if (!body.contains("proof_receipt")) {
+                    res.status = 400;
+                    res.set_content(err_json("proof_receipt required by circle hfhe policy").dump(), "application/json");
+                    return;
+                }
+                if (!circle_verify_proof_receipt(
+                        circle_id,
+                        "encrypt",
+                        g_wallet.addr,
+                        key_id,
+                        intent_id,
+                        decrypt_proof,
+                        policy,
+                        body["ciphertext"].get<std::string>(),
+                        "",
+                        body["proof_receipt"],
+                        error)) {
+                    res.status = 400;
+                    res.set_content(err_json(error).dump(), "application/json");
+                    return;
+                }
+            }
+        } else if (decrypt_proof == "zero_receipt_v1") {
+            std::string zero_proof = body.value("zero_proof", "");
+            if (zero_proof.empty()) {
+                res.status = 400;
+                res.set_content(err_json("zero_proof required by circle hfhe policy").dump(), "application/json");
+                return;
+            }
+            if (!circle_verify_zero_with_wallet(body["ciphertext"].get<std::string>(), zero_proof, error)) {
+                res.status = 400;
+                res.set_content(err_json(error).dump(), "application/json");
+                return;
+            }
+            if (!body.contains("proof_receipt")) {
+                res.status = 400;
+                res.set_content(err_json("proof_receipt required by circle hfhe policy").dump(), "application/json");
+                return;
+            }
+            if (!circle_verify_proof_receipt(
+                    circle_id,
+                    "encrypt",
+                    g_wallet.addr,
+                    key_id,
+                    intent_id,
+                    decrypt_proof,
+                    policy,
+                    body["ciphertext"].get<std::string>(),
+                    "",
+                    body["proof_receipt"],
+                    error)) {
+                res.status = 400;
+                res.set_content(err_json(error).dump(), "application/json");
+                return;
+            }
+        } else if (decrypt_proof != "none") {
+            res.status = 400;
+            res.set_content(err_json("unsupported circle hfhe decrypt proof policy").dump(), "application/json");
+            return;
+        }
+        std::string b64 = body["ciphertext"].get<std::string>();
+        auto raw = octra::base64_decode(b64);
+        if (raw.empty()) {
+            res.status = 400;
+            res.set_content(err_json("invalid base64").dump(), "application/json");
+            return;
+        }
+        pvac_cipher ct = g_pvac.deserialize_cipher(raw.data(), raw.size());
+        if (!ct) {
+            res.status = 400;
+            res.set_content(err_json("invalid ciphertext").dump(), "application/json");
+            return;
+        }
+        uint64_t lo = 0, hi = 0;
+        g_pvac.decrypt_fp(ct, lo, hi);
+        g_pvac.free_cipher(ct);
+        int64_t val;
+        if (hi == 0) {
+            val = static_cast<int64_t>(lo);
+        } else {
+            __uint128_t p = (__uint128_t(1) << 127) - 1;
+            __uint128_t full = (__uint128_t(hi) << 64) | lo;
+            if (full > p / 2) val = -static_cast<int64_t>(p - full);
+            else val = static_cast<int64_t>(lo);
+        }
+        json result;
+        result["value"] = val;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/fhe/commit", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (!g_pvac_ok) {
+            res.status = 500;
+            res.set_content(err_json("pvac not available").dump(), "application/json");
+            return;
+        }
+        auto body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.contains("circle_id") || !body.contains("ciphertext")) {
+            res.status = 400;
+            res.set_content(err_json("circle_id and ciphertext required").dump(), "application/json");
+            return;
+        }
+        std::string error;
+        if (!circle_hfhe_authorize(
+                body["circle_id"].get<std::string>(),
+                "commit_mode",
+                g_wallet.addr,
+                body.value("key_id", ""),
+                body.value("intent_id", ""),
+                error)) {
+            res.status = 403;
+            res.set_content(err_json(error).dump(), "application/json");
+            return;
+        }
+        auto raw = octra::base64_decode(body["ciphertext"].get<std::string>());
+        if (raw.empty()) {
+            res.status = 400;
+            res.set_content(err_json("invalid ciphertext").dump(), "application/json");
+            return;
+        }
+        pvac_cipher ct = g_pvac.deserialize_cipher(raw.data(), raw.size());
+        if (!ct) {
+            res.status = 400;
+            res.set_content(err_json("invalid ciphertext").dump(), "application/json");
+            return;
+        }
+        auto commitment = g_pvac.commit_ct(ct);
+        g_pvac.free_cipher(ct);
+        json result;
+        result["ciphertext_commitment"] = octra::base64_encode(commitment.data(), commitment.size());
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/fhe/pedersen", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (!g_pvac_ok) {
+            res.status = 500;
+            res.set_content(err_json("pvac not available").dump(), "application/json");
+            return;
+        }
+        auto body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.contains("circle_id") || !body.contains("value")) {
+            res.status = 400;
+            res.set_content(err_json("circle_id and value required").dump(), "application/json");
+            return;
+        }
+        std::string error;
+        if (!circle_hfhe_authorize(
+                body["circle_id"].get<std::string>(),
+                "pedersen_mode",
+                g_wallet.addr,
+                body.value("key_id", ""),
+                body.value("intent_id", ""),
+                error)) {
+            res.status = 403;
+            res.set_content(err_json(error).dump(), "application/json");
+            return;
+        }
+        int64_t value = body["value"].get<int64_t>();
+        std::array<uint8_t, 32> blinding = {};
+        bool provided_blinding = false;
+        if (body.contains("blinding")) {
+            std::string blinding_b64 = body["blinding"].get<std::string>();
+            auto raw = octra::base64_decode(blinding_b64);
+            if (raw.size() != blinding.size()) {
+                res.status = 400;
+                res.set_content(err_json("blinding must decode to 32 bytes").dump(), "application/json");
+                return;
+            }
+            std::copy(raw.begin(), raw.end(), blinding.begin());
+            provided_blinding = true;
+        } else {
+            octra::random_bytes(blinding.data(), blinding.size());
+        }
+        auto amount_commitment =
+            g_pvac.pedersen_commit(static_cast<uint64_t>(value), blinding.data());
+        json result;
+        result["amount_commitment"] = octra::base64_encode(amount_commitment.data(), amount_commitment.size());
+        result["blinding"] = octra::base64_encode(blinding.data(), blinding.size());
+        result["generated_blinding"] = !provided_blinding;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/fhe/serialize_cipher", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (!g_pvac_ok) {
+            res.status = 500;
+            res.set_content(err_json("pvac not available").dump(), "application/json");
+            return;
+        }
+        auto body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.contains("circle_id") || !body.contains("ciphertext")) {
+            res.status = 400;
+            res.set_content(err_json("circle_id and ciphertext required").dump(), "application/json");
+            return;
+        }
+        std::string error;
+        if (!circle_hfhe_authorize(
+                body["circle_id"].get<std::string>(),
+                "cipher_serde_mode",
+                g_wallet.addr,
+                body.value("key_id", ""),
+                body.value("intent_id", ""),
+                error)) {
+            res.status = 403;
+            res.set_content(err_json(error).dump(), "application/json");
+            return;
+        }
+        auto raw = octra::base64_decode(body["ciphertext"].get<std::string>());
+        if (raw.empty()) {
+            res.status = 400;
+            res.set_content(err_json("invalid ciphertext").dump(), "application/json");
+            return;
+        }
+        pvac_cipher ct = g_pvac.deserialize_cipher(raw.data(), raw.size());
+        if (!ct) {
+            res.status = 400;
+            res.set_content(err_json("invalid ciphertext").dump(), "application/json");
+            return;
+        }
+        auto serialized = g_pvac.serialize_cipher(ct);
+        g_pvac.free_cipher(ct);
+        json result;
+        result["serialized_cipher"] = octra::base64_encode(serialized.data(), serialized.size());
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/fhe/deserialize_cipher", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (!g_pvac_ok) {
+            res.status = 500;
+            res.set_content(err_json("pvac not available").dump(), "application/json");
+            return;
+        }
+        auto body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.contains("circle_id") || !body.contains("serialized_cipher")) {
+            res.status = 400;
+            res.set_content(err_json("circle_id and serialized_cipher required").dump(), "application/json");
+            return;
+        }
+        std::string error;
+        if (!circle_hfhe_authorize(
+                body["circle_id"].get<std::string>(),
+                "cipher_serde_mode",
+                g_wallet.addr,
+                body.value("key_id", ""),
+                body.value("intent_id", ""),
+                error)) {
+            res.status = 403;
+            res.set_content(err_json(error).dump(), "application/json");
+            return;
+        }
+        auto raw = octra::base64_decode(body["serialized_cipher"].get<std::string>());
+        if (raw.empty()) {
+            res.status = 400;
+            res.set_content(err_json("invalid serialized cipher").dump(), "application/json");
+            return;
+        }
+        pvac_cipher ct = g_pvac.deserialize_cipher(raw.data(), raw.size());
+        if (!ct) {
+            res.status = 400;
+            res.set_content(err_json("invalid serialized cipher").dump(), "application/json");
+            return;
+        }
+        auto normalized = g_pvac.serialize_cipher(ct);
+        g_pvac.free_cipher(ct);
+        json result;
+        result["ciphertext"] = octra::base64_encode(normalized.data(), normalized.size());
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/fhe/verify_zero", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (!g_pvac_ok) {
+            res.status = 500;
+            res.set_content(err_json("pvac not available").dump(), "application/json");
+            return;
+        }
+        auto body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.contains("circle_id") || !body.contains("ciphertext") || !body.contains("zero_proof")) {
+            res.status = 400;
+            res.set_content(err_json("circle_id, ciphertext and zero_proof required").dump(), "application/json");
+            return;
+        }
+        std::string error;
+        if (!circle_hfhe_authorize(
+                body["circle_id"].get<std::string>(),
+                "verify_zero_mode",
+                g_wallet.addr,
+                body.value("key_id", ""),
+                body.value("intent_id", ""),
+                error)) {
+            res.status = 403;
+            res.set_content(err_json(error).dump(), "application/json");
+            return;
+        }
+        auto policy_r = circle_hfhe_policy_auth_rpc(body["circle_id"].get<std::string>());
+        if (!policy_r.ok) {
+            res.status = 400;
+            res.set_content(err_json(policy_r.error.empty() ? "circle hfhe policy read failed" : policy_r.error).dump(), "application/json");
+            return;
+        }
+        auto policy = policy_r.result.value("policy", json::object());
+        std::string encrypt_proof = policy.value("encrypt_proof", "bound_zero_v1");
+        if (encrypt_proof == "zero_receipt_v1") {
+            if (!body.contains("proof_receipt")) {
+                res.status = 400;
+                res.set_content(err_json("proof_receipt required by circle hfhe policy").dump(), "application/json");
+                return;
+            }
+            if (!circle_verify_proof_receipt(
+                    body["circle_id"].get<std::string>(),
+                    "encrypt",
+                    g_wallet.addr,
+                    body.value("key_id", ""),
+                    body.value("intent_id", ""),
+                    encrypt_proof,
+                    policy,
+                    body["ciphertext"].get<std::string>(),
+                    "",
+                    body["proof_receipt"],
+                    error)) {
+                res.status = 400;
+                res.set_content(err_json(error).dump(), "application/json");
+                return;
+            }
+        }
+        bool ok = circle_verify_zero_with_wallet(
+            body["ciphertext"].get<std::string>(),
+            body["zero_proof"].get<std::string>(),
+            error);
+        if (!ok && !error.empty()) {
+            res.status = 400;
+            res.set_content(err_json(error).dump(), "application/json");
+            return;
+        }
+        res.set_content(json({{"ok", ok}}).dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/fhe/verify_range", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (!g_pvac_ok) {
+            res.status = 500;
+            res.set_content(err_json("pvac not available").dump(), "application/json");
+            return;
+        }
+        auto body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.contains("circle_id") || !body.contains("ciphertext") || !body.contains("range_proof")) {
+            res.status = 400;
+            res.set_content(err_json("circle_id, ciphertext and range_proof required").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body["circle_id"].get<std::string>();
+        std::string key_id = body.value("key_id", "");
+        std::string intent_id = body.value("intent_id", "");
+        std::string error;
+        if (!circle_hfhe_authorize(
+                circle_id,
+                "verify_range_mode",
+                g_wallet.addr,
+                key_id,
+                intent_id,
+                error)) {
+            res.status = 403;
+            res.set_content(err_json(error).dump(), "application/json");
+            return;
+        }
+        auto policy_r = circle_hfhe_policy_auth_rpc(circle_id);
+        if (!policy_r.ok) {
+            res.status = 400;
+            res.set_content(err_json(policy_r.error.empty() ? "circle hfhe policy read failed" : policy_r.error).dump(), "application/json");
+            return;
+        }
+        auto policy = policy_r.result.value("policy", json::object());
+        std::string encrypt_proof = policy.value("encrypt_proof", "bound_zero_v1");
+        if (encrypt_proof == "range_receipt_v1") {
+            if (!body.contains("proof_receipt")) {
+                res.status = 400;
+                res.set_content(err_json("proof_receipt required by circle hfhe policy").dump(), "application/json");
+                return;
+            }
+            if (!circle_verify_proof_receipt(
+                    circle_id,
+                    "encrypt",
+                    g_wallet.addr,
+                    key_id,
+                    intent_id,
+                    encrypt_proof,
+                    policy,
+                    body["ciphertext"].get<std::string>(),
+                    "",
+                    body["proof_receipt"],
+                    error)) {
+                res.status = 400;
+                res.set_content(err_json(error).dump(), "application/json");
+                return;
+            }
+        }
+        bool ok = circle_verify_range_with_wallet(
+            body["ciphertext"].get<std::string>(),
+            body["range_proof"].get<std::string>(),
+            error);
+        if (!ok && !error.empty()) {
+            res.status = 400;
+            res.set_content(err_json(error).dump(), "application/json");
+            return;
+        }
+        res.set_content(json({{"ok", ok}}).dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/fhe/verify_bound", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (!g_pvac_ok) {
+            res.status = 500;
+            res.set_content(err_json("pvac not available").dump(), "application/json");
+            return;
+        }
+        auto body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.contains("circle_id") || !body.contains("ciphertext") || !body.contains("zero_proof") || !body.contains("amount_commitment")) {
+            res.status = 400;
+            res.set_content(err_json("circle_id, ciphertext, zero_proof and amount_commitment required").dump(), "application/json");
+            return;
+        }
+        std::string error;
+        if (!circle_hfhe_authorize(
+                body["circle_id"].get<std::string>(),
+                "verify_bound_mode",
+                g_wallet.addr,
+                body.value("key_id", ""),
+                body.value("intent_id", ""),
+                error)) {
+            res.status = 403;
+            res.set_content(err_json(error).dump(), "application/json");
+            return;
+        }
+        auto policy_r = circle_hfhe_policy_auth_rpc(body["circle_id"].get<std::string>());
+        if (!policy_r.ok) {
+            res.status = 400;
+            res.set_content(err_json(policy_r.error.empty() ? "circle hfhe policy read failed" : policy_r.error).dump(), "application/json");
+            return;
+        }
+        auto policy = policy_r.result.value("policy", json::object());
+        std::string encrypt_proof = policy.value("encrypt_proof", "bound_zero_v1");
+        if (encrypt_proof == "bound_zero_receipt_v1") {
+            if (!body.contains("proof_receipt")) {
+                res.status = 400;
+                res.set_content(err_json("proof_receipt required by circle hfhe policy").dump(), "application/json");
+                return;
+            }
+            if (!circle_verify_proof_receipt(
+                    body["circle_id"].get<std::string>(),
+                    "encrypt",
+                    g_wallet.addr,
+                    body.value("key_id", ""),
+                    body.value("intent_id", ""),
+                    encrypt_proof,
+                    policy,
+                    body["ciphertext"].get<std::string>(),
+                    body["amount_commitment"].get<std::string>(),
+                    body["proof_receipt"],
+                    error)) {
+                res.status = 400;
+                res.set_content(err_json(error).dump(), "application/json");
+                return;
+            }
+        }
+        bool ok = circle_verify_bound_with_wallet(
+            body["ciphertext"].get<std::string>(),
+            body["zero_proof"].get<std::string>(),
+            body["amount_commitment"].get<std::string>(),
+            error);
+        if (!ok && !error.empty()) {
+            res.status = 400;
+            res.set_content(err_json(error).dump(), "application/json");
+            return;
+        }
+        res.set_content(json({{"ok", ok}}).dump(), "application/json");
+    });
+
     svr.Get("/api/contract/info", [](const httplib::Request& req, httplib::Response& res) {
         WALLET_GUARD
         std::string addr = req.get_param_value("address");
@@ -2599,6 +4104,7 @@ int main(int argc, char** argv) {
     });
 
     svr.Get("/api/circle/info", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
         std::string circle_id = req.get_param_value("circle_id");
         if (circle_id.empty()) {
             res.status = 400;
@@ -2608,6 +4114,797 @@ int main(int argc, char** argv) {
         }
         octra::RpcClient rpc(current_public_rpc_url());
         auto r = rpc.circle_info(circle_id);
+        if (!r.ok) {
+            r = rpc.circle_info_auth(
+                circle_id,
+                g_wallet.addr,
+                g_wallet.pub_b64,
+                sign_circle_read_request("octra_circle_info", circle_id));
+        }
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/slot_policy", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string slot_ref = req.get_param_value("slot_ref");
+        if (circle_id.empty() || slot_ref.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and slot_ref required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_slot_policy_auth(
+            circle_id,
+            slot_ref,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_slot_policy", circle_id, slot_ref));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/state_policy", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string state_ref = req.get_param_value("state_ref");
+        if (circle_id.empty() || state_ref.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and state_ref required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_state_policy_auth(
+            circle_id,
+            state_ref,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_state_policy", circle_id, state_ref));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/state_descriptor", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string state_ref = req.get_param_value("state_ref");
+        if (circle_id.empty() || state_ref.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and state_ref required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_state_descriptor_auth(
+            circle_id,
+            state_ref,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_state_descriptor", circle_id, state_ref));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/balance_cell", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string state_ref = req.get_param_value("state_ref");
+        if (circle_id.empty() || state_ref.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and state_ref required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_balance_cell_auth(
+            circle_id,
+            state_ref,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_balance_cell", circle_id, state_ref));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/register_cell", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string state_ref = req.get_param_value("state_ref");
+        if (circle_id.empty() || state_ref.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and state_ref required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_register_cell_auth(
+            circle_id,
+            state_ref,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_register_cell", circle_id, state_ref));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/balance_binding", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string subject_addr = req.get_param_value("subject_addr");
+        if (circle_id.empty() || subject_addr.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and subject_addr required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_balance_binding_auth(
+            circle_id,
+            subject_addr,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_balance_binding", circle_id, subject_addr));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/register_binding", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string register_ref = req.get_param_value("register_ref");
+        if (circle_id.empty() || register_ref.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and register_ref required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_register_binding_auth(
+            circle_id,
+            register_ref,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_register_binding", circle_id, register_ref));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/balance_workflow", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string workflow_ref = req.get_param_value("workflow_ref");
+        if (circle_id.empty() || workflow_ref.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and workflow_ref required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_balance_workflow_auth(
+            circle_id,
+            workflow_ref,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_balance_workflow", circle_id, workflow_ref));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/register_workflow", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string workflow_ref = req.get_param_value("workflow_ref");
+        if (circle_id.empty() || workflow_ref.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and workflow_ref required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_register_workflow_auth(
+            circle_id,
+            workflow_ref,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_register_workflow", circle_id, workflow_ref));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/object_summary", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string object_ref = req.get_param_value("object_ref");
+        if (circle_id.empty() || object_ref.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and object_ref required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_object_summary_auth(
+            circle_id,
+            object_ref,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_object_summary", circle_id, object_ref));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/object_members", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string object_ref = req.get_param_value("object_ref");
+        if (circle_id.empty() || object_ref.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and object_ref required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_object_members_auth(
+            circle_id,
+            object_ref,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_object_members", circle_id, object_ref));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/object_detail", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string object_ref = req.get_param_value("object_ref");
+        if (circle_id.empty() || object_ref.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and object_ref required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_object_detail_auth(
+            circle_id,
+            object_ref,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_object_detail", circle_id, object_ref));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/object_member", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string object_ref = req.get_param_value("object_ref");
+        std::string member_ref = req.get_param_value("member_ref");
+        if (circle_id.empty() || object_ref.empty() || member_ref.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id, object_ref and member_ref required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_object_member_auth(
+            circle_id,
+            object_ref,
+            member_ref,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_object_member", circle_id, object_ref + "|" + member_ref));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/object_refs", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        if (circle_id.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_object_refs_auth(
+            circle_id,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_object_refs", circle_id));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/object_list", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        if (circle_id.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_object_list_auth(
+            circle_id,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_object_list", circle_id));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/object_policy_define", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string object_ref = body.value("object_ref", "");
+        std::string transition_mode = body.value("transition_mode", "");
+        std::string required_proof_kind = body.value("required_proof_kind", "");
+        if (circle_id.empty() || object_ref.empty() || transition_mode.empty() || required_proof_kind.empty()
+            || !body.contains("member_quorum") || !body["member_quorum"].is_number_integer()
+            || !body.contains("allow_detach") || !body["allow_detach"].is_boolean()
+            || !body.contains("allow_root_state_rotation") || !body["allow_root_state_rotation"].is_boolean()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id, object_ref, transition_mode, required_proof_kind, member_quorum, allow_detach, and allow_root_state_rotation required").dump(), "application/json");
+            return;
+        }
+        json params = json::array({
+            object_ref,
+            body.value("delivery_key_id", ""),
+            body.value("activate_after_epoch", 0),
+            body.value("expire_after_epoch", 0),
+            transition_mode,
+            required_proof_kind,
+            body["member_quorum"].get<int>(),
+            body["allow_detach"].get<bool>(),
+            body["allow_root_state_rotation"].get<bool>()
+        });
+        auto result = submit_program_call_tx(
+            circle_id,
+            "circle_call",
+            body.value("method", "define_object_policy_native"),
+            params,
+            body,
+            "1000");
+        if (result.contains("error")) res.status = 500;
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/object_bind", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string object_ref = body.value("object_ref", "");
+        std::string state_ref = body.value("state_ref", "");
+        std::string transition_ref = body.value("transition_ref", "");
+        std::string status = body.value("status", "");
+        if (circle_id.empty() || object_ref.empty() || state_ref.empty() || transition_ref.empty() || status.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id, object_ref, state_ref, transition_ref, and status required").dump(), "application/json");
+            return;
+        }
+        json params = json::array({object_ref, state_ref, transition_ref, status});
+        auto result = submit_program_call_tx(
+            circle_id,
+            "circle_call",
+            body.value("method", "bind_object_native"),
+            params,
+            body,
+            "1000");
+        if (result.contains("error")) res.status = 500;
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/object_member_attach", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string object_ref = body.value("object_ref", "");
+        std::string member_ref = body.value("member_ref", "");
+        std::string state_ref = body.value("state_ref", "");
+        std::string member_kind = body.value("member_kind", "");
+        std::string state_class = body.value("state_class", "");
+        std::string codec = body.value("codec", "");
+        std::string status = body.value("status", "");
+        if (circle_id.empty() || object_ref.empty() || member_ref.empty() || state_ref.empty()
+            || member_kind.empty() || state_class.empty() || codec.empty() || status.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id, object_ref, member_ref, state_ref, member_kind, state_class, codec, and status required").dump(), "application/json");
+            return;
+        }
+        json params = json::array({object_ref, member_ref, state_ref, member_kind, state_class, codec, status});
+        auto result = submit_program_call_tx(
+            circle_id,
+            "circle_call",
+            body.value("method", "attach_object_member_native"),
+            params,
+            body,
+            "1000");
+        if (result.contains("error")) res.status = 500;
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/object_member_detach", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string object_ref = body.value("object_ref", "");
+        std::string member_ref = body.value("member_ref", "");
+        if (circle_id.empty() || object_ref.empty() || member_ref.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id, object_ref, and member_ref required").dump(), "application/json");
+            return;
+        }
+        json params = json::array({object_ref, member_ref});
+        auto result = submit_program_call_tx(
+            circle_id,
+            "circle_call",
+            body.value("method", "detach_object_member_native"),
+            params,
+            body,
+            "1000");
+        if (result.contains("error")) res.status = 500;
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/object_transition_apply", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string transition_ref = body.value("transition_ref", "");
+        std::string object_ref = body.value("object_ref", "");
+        std::string next_state_ref = body.value("next_state_ref", "");
+        std::string status = body.value("status", "");
+        std::string intent_id = body.value("intent_id", "");
+        if (circle_id.empty() || transition_ref.empty() || object_ref.empty() || next_state_ref.empty() || status.empty() || intent_id.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id, transition_ref, object_ref, next_state_ref, status, and intent_id required").dump(), "application/json");
+            return;
+        }
+        json params = json::array({
+            transition_ref,
+            object_ref,
+            body.value("previous_state_ref", ""),
+            next_state_ref,
+            body.value("member_bundle", ""),
+            body.value("touched_members_hash", ""),
+            body.value("proof_kind", ""),
+            body.value("proof_receipt_hash", ""),
+            status,
+            intent_id
+        });
+        auto result = submit_program_call_tx(
+            circle_id,
+            "circle_call",
+            body.value("method", "apply_object_transition_native"),
+            params,
+            body,
+            "1000");
+        if (result.contains("error")) res.status = 500;
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/transport_policy", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        if (circle_id.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_transport_policy_auth(
+            circle_id,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_transport_policy", circle_id));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/hfhe_policy", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        if (circle_id.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_hfhe_policy_auth(
+            circle_id,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_hfhe_policy", circle_id));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/key_policy", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string key_id = req.get_param_value("key_id");
+        if (circle_id.empty() || key_id.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and key_id required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_key_policy_auth(
+            circle_id,
+            key_id,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_key_policy", circle_id, key_id));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/outbox_intent", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string intent_id = req.get_param_value("intent_id");
+        if (circle_id.empty() || intent_id.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and intent_id required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_outbox_intent_auth(
+            circle_id,
+            intent_id,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_outbox_intent", circle_id, intent_id));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/outbox_claim", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string intent_id = req.get_param_value("intent_id");
+        if (circle_id.empty() || intent_id.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and intent_id required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_outbox_claim_auth(
+            circle_id,
+            intent_id,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_outbox_claim", circle_id, intent_id));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/outbox_status", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string intent_id = req.get_param_value("intent_id");
+        if (circle_id.empty() || intent_id.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and intent_id required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_outbox_status_auth(
+            circle_id,
+            intent_id,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_outbox_status", circle_id, intent_id));
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/ingress_packet", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string intent_id = req.get_param_value("intent_id");
+        if (circle_id.empty() || intent_id.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and intent_id required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_ingress_packet_auth(
+            circle_id,
+            intent_id,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_ingress_packet", circle_id, intent_id));
         if (!r.ok) {
             res.status = 404;
             res.set_header("Access-Control-Allow-Origin", "*");
@@ -2640,6 +4937,7 @@ int main(int argc, char** argv) {
     });
 
     svr.Get("/api/circle/asset_ciphertext", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
         std::string circle_id = req.get_param_value("circle_id");
         std::string path = req.get_param_value("path");
         if (circle_id.empty() || path.empty()) {
@@ -2651,6 +4949,14 @@ int main(int argc, char** argv) {
         octra::RpcClient rpc(current_public_rpc_url());
         auto r = rpc.circle_asset_ciphertext(circle_id, path);
         if (!r.ok) {
+            r = rpc.circle_asset_ciphertext_auth(
+                circle_id,
+                path,
+                g_wallet.addr,
+                g_wallet.pub_b64,
+                sign_circle_read_request("octra_circle_asset_ciphertext", circle_id, "path|" + path));
+        }
+        if (!r.ok) {
             res.status = 404;
             res.set_header("Access-Control-Allow-Origin", "*");
             res.set_content(err_json(r.error).dump(), "application/json");
@@ -2661,6 +4967,7 @@ int main(int argc, char** argv) {
     });
 
     svr.Get("/api/circle/asset_ciphertext_by_key", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
         std::string circle_id = req.get_param_value("circle_id");
         std::string resource_key = req.get_param_value("resource_key");
         if (circle_id.empty() || resource_key.empty()) {
@@ -2671,6 +4978,74 @@ int main(int argc, char** argv) {
         }
         octra::RpcClient rpc(current_public_rpc_url());
         auto r = rpc.circle_asset_ciphertext_by_resource_key(circle_id, resource_key);
+        if (!r.ok) {
+            r = rpc.circle_asset_ciphertext_by_resource_key_auth(
+                circle_id,
+                resource_key,
+                g_wallet.addr,
+                g_wallet.pub_b64,
+                sign_circle_read_request("octra_circle_asset_ciphertext_by_resource_key", circle_id, "resource_key|" + resource_key));
+        }
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/asset_ciphertext_by_slot", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string slot_ref = req.get_param_value("slot_ref");
+        if (circle_id.empty() || slot_ref.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and slot_ref required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_asset_ciphertext_by_slot_ref(circle_id, slot_ref);
+        if (!r.ok) {
+            r = rpc.circle_asset_ciphertext_by_slot_ref_auth(
+                circle_id,
+                slot_ref,
+                g_wallet.addr,
+                g_wallet.pub_b64,
+                sign_circle_read_request("octra_circle_asset_ciphertext_by_slot_ref", circle_id, "slot_ref|" + slot_ref));
+        }
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/asset_ciphertext_by_state", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string state_ref = req.get_param_value("state_ref");
+        if (circle_id.empty() || state_ref.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and state_ref required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_asset_ciphertext_by_state_ref(circle_id, state_ref);
+        if (!r.ok) {
+            r = rpc.circle_asset_ciphertext_by_state_ref_auth(
+                circle_id,
+                state_ref,
+                g_wallet.addr,
+                g_wallet.pub_b64,
+                sign_circle_read_request("octra_circle_asset_ciphertext_by_state_ref", circle_id, "state_ref|" + state_ref));
+        }
         if (!r.ok) {
             res.status = 404;
             res.set_header("Access-Control-Allow-Origin", "*");
@@ -2691,15 +5066,27 @@ int main(int argc, char** argv) {
             res.set_content(err_json("invalid json").dump(), "application/json");
             return;
         }
-        std::string circle_id = body.value("circle_id", "");
-        std::string runtime = body.value("runtime", "octb");
-        std::string privacy_class = body.value("privacy_class", "sealed");
-        std::string browser_mode = body.value("browser_mode", "native_sealed");
-        std::string resource_mode = body.value("resource_mode", "sealed_read");
-        std::string code_b64 = body.value("code_b64", "");
-        std::string policy_hash = body.value("policy_hash", "");
-        std::string members_root = body.value("members_root", "");
-        std::string export_policy = body.value("export_policy", "");
+        auto read_string_or = [&](const char* key, const char* fallback) -> std::string {
+            if (!body.contains(key) || body[key].is_null()) {
+                return fallback;
+            }
+            if (body[key].is_string()) {
+                return body[key].get<std::string>();
+            }
+            return fallback;
+        };
+        auto read_optional_string = [&](const char* key) -> std::string {
+            return read_string_or(key, "");
+        };
+        std::string circle_id = read_string_or("circle_id", "");
+        std::string runtime = read_string_or("runtime", "octb");
+        std::string privacy_class = read_string_or("privacy_class", "sealed");
+        std::string browser_mode = read_string_or("browser_mode", "native_sealed");
+        std::string resource_mode = read_string_or("resource_mode", "sealed_read");
+        std::string code_b64 = read_optional_string("code_b64");
+        std::string policy_hash = read_optional_string("policy_hash");
+        std::string members_root = read_optional_string("members_root");
+        std::string export_policy = read_optional_string("export_policy");
         if (circle_id.empty()) {
             res.status = 400;
             res.set_content(err_json("circle_id required").dump(), "application/json");
@@ -2765,15 +5152,241 @@ int main(int argc, char** argv) {
         }
         std::string circle_id = body.value("circle_id", "");
         std::string path = body.value("path", "");
+        std::string slot_ref = body.value("slot_ref", "");
+        std::string state_ref = body.value("state_ref", "");
         std::string content_type = body.value("content_type", "");
         std::string ciphertext_b64 = body.value("ciphertext_b64", "");
         std::string key_id = body.value("key_id", "");
         std::string plaintext_hash = body.value("plaintext_hash", "");
         std::string encoding = body.value("encoding", "");
         std::string padding_class = body.value("padding_class", "");
-        if (circle_id.empty() || path.empty() || content_type.empty() || ciphertext_b64.empty() || key_id.empty() || plaintext_hash.empty()) {
+        auto read_optional_scalar = [&](const char* key) -> std::string {
+            if (!body.contains(key)) {
+                return "";
+            }
+            if (body[key].is_string()) {
+                return body[key].get<std::string>();
+            }
+            if (body[key].is_number_integer()) {
+                return std::to_string(body[key].get<long long>());
+            }
+            return "";
+        };
+        std::string activate_after_epoch = read_optional_scalar("activate_after_epoch");
+        std::string expire_after_epoch = read_optional_scalar("expire_after_epoch");
+        std::string metadata_mode = body.value("metadata_mode", "");
+        if (circle_id.empty() || content_type.empty() || ciphertext_b64.empty() || key_id.empty() || plaintext_hash.empty()) {
             res.status = 400;
-            res.set_content(err_json("circle_id, path, content_type, ciphertext_b64, key_id, and plaintext_hash required").dump(), "application/json");
+            res.set_content(err_json("circle_id, content_type, ciphertext_b64, key_id, and plaintext_hash required").dump(), "application/json");
+            return;
+        }
+        int locator_count = 0;
+        if (!path.empty()) locator_count += 1;
+        if (!slot_ref.empty()) locator_count += 1;
+        if (!state_ref.empty()) locator_count += 1;
+        if (locator_count != 1) {
+            res.status = 400;
+            res.set_content(err_json("provide exactly one of path, slot_ref, or state_ref").dump(), "application/json");
+            return;
+        }
+        if (ciphertext_b64.size() > CIRCLE_ASSET_MAX_B64_BYTES) {
+            res.status = 400;
+            res.set_content(err_json("circle asset body exceeds max encoded size").dump(), "application/json");
+            return;
+        }
+        const std::string default_ou = std::to_string(circle_asset_ou_from_b64_len(ciphertext_b64.size()));
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id;
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, default_ou);
+        tx.timestamp = now_ts();
+        tx.op_type = "circle_asset_put_encrypted";
+        tx.encrypted_data = ciphertext_b64;
+        json payload;
+        if (!path.empty()) payload["path"] = path;
+        if (!slot_ref.empty()) payload["slot_ref"] = slot_ref;
+        if (!state_ref.empty()) payload["state_ref"] = state_ref;
+        payload["content_type"] = content_type;
+        payload["key_id"] = key_id;
+        payload["plaintext_hash"] = plaintext_hash;
+        if (!encoding.empty()) payload["encoding"] = encoding;
+        if (!padding_class.empty()) payload["padding_class"] = padding_class;
+        if (!activate_after_epoch.empty()) payload["activate_after_epoch"] = activate_after_epoch;
+        if (!expire_after_epoch.empty()) payload["expire_after_epoch"] = expire_after_epoch;
+        if (!metadata_mode.empty()) payload["metadata_mode"] = metadata_mode;
+        tx.message = payload.dump();
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/asset_plain", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string path = body.value("path", "");
+        std::string content_type = body.value("content_type", "");
+        std::string body_b64 = body.value("body_b64", "");
+        std::string encoding = body.value("encoding", "");
+        if (circle_id.empty() || path.empty() || content_type.empty() || body_b64.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id, path, content_type, and body_b64 required").dump(), "application/json");
+            return;
+        }
+        if (body_b64.size() > CIRCLE_ASSET_MAX_B64_BYTES) {
+            res.status = 400;
+            res.set_content(err_json("circle asset body exceeds max encoded size").dump(), "application/json");
+            return;
+        }
+        const std::string default_ou = std::to_string(circle_asset_ou_from_b64_len(body_b64.size()));
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id;
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, default_ou);
+        tx.timestamp = now_ts();
+        tx.op_type = "circle_asset_put";
+        tx.encrypted_data = body_b64;
+        json payload;
+        payload["path"] = path;
+        payload["content_type"] = content_type;
+        if (!encoding.empty()) payload["encoding"] = encoding;
+        tx.message = payload.dump();
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/sealed_slot_put", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string slot_ref = body.value("slot_ref", "");
+        std::string state_ref = body.value("state_ref", "");
+        std::string content_type = body.value("content_type", "");
+        std::string ciphertext_b64 = body.value("ciphertext_b64", "");
+        std::string key_id = body.value("key_id", "");
+        std::string plaintext_hash = body.value("plaintext_hash", "");
+        std::string encoding = body.value("encoding", "");
+        std::string padding_class = body.value("padding_class", "");
+        auto read_optional_scalar = [&](const char* key) -> std::string {
+            if (!body.contains(key)) {
+                return "";
+            }
+            if (body[key].is_string()) {
+                return body[key].get<std::string>();
+            }
+            if (body[key].is_number_integer()) {
+                return std::to_string(body[key].get<long long>());
+            }
+            return "";
+        };
+        std::string activate_after_epoch = read_optional_scalar("activate_after_epoch");
+        std::string expire_after_epoch = read_optional_scalar("expire_after_epoch");
+        std::string metadata_mode = body.value("metadata_mode", "");
+        if (circle_id.empty() || content_type.empty() || ciphertext_b64.empty() || key_id.empty() || plaintext_hash.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id, content_type, ciphertext_b64, key_id, and plaintext_hash required").dump(), "application/json");
+            return;
+        }
+        if ((slot_ref.empty() && state_ref.empty()) || (!slot_ref.empty() && !state_ref.empty())) {
+            res.status = 400;
+            res.set_content(err_json("provide exactly one of slot_ref or state_ref").dump(), "application/json");
+            return;
+        }
+        if (ciphertext_b64.size() > CIRCLE_ASSET_MAX_B64_BYTES) {
+            res.status = 400;
+            res.set_content(err_json("circle asset body exceeds max encoded size").dump(), "application/json");
+            return;
+        }
+        const std::string default_ou = std::to_string(circle_asset_ou_from_b64_len(ciphertext_b64.size()));
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id;
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, default_ou);
+        tx.timestamp = now_ts();
+        tx.op_type = "circle_sealed_slot_put";
+        tx.encrypted_data = ciphertext_b64;
+        json payload;
+        if (!slot_ref.empty()) payload["slot_ref"] = slot_ref;
+        if (!state_ref.empty()) payload["state_ref"] = state_ref;
+        payload["content_type"] = content_type;
+        payload["key_id"] = key_id;
+        payload["plaintext_hash"] = plaintext_hash;
+        if (!encoding.empty()) payload["encoding"] = encoding;
+        if (!padding_class.empty()) payload["padding_class"] = padding_class;
+        if (!activate_after_epoch.empty()) payload["activate_after_epoch"] = activate_after_epoch;
+        if (!expire_after_epoch.empty()) payload["expire_after_epoch"] = expire_after_epoch;
+        if (!metadata_mode.empty()) payload["metadata_mode"] = metadata_mode;
+        tx.message = payload.dump();
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/slot_policy_put", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string slot_ref = body.value("slot_ref", "");
+        std::string state_ref = body.value("state_ref", "");
+        std::string delivery_key_id = body.value("delivery_key_id", "");
+        auto read_optional_scalar = [&](const char* key) -> std::string {
+            if (!body.contains(key)) {
+                return "";
+            }
+            if (body[key].is_string()) {
+                return body[key].get<std::string>();
+            }
+            if (body[key].is_number_integer()) {
+                return std::to_string(body[key].get<long long>());
+            }
+            return "";
+        };
+        std::string activate_after_epoch = read_optional_scalar("activate_after_epoch");
+        std::string expire_after_epoch = read_optional_scalar("expire_after_epoch");
+        bool tombstone = body.value("tombstone", false);
+        bool revoked = body.value("revoked", false);
+        if (circle_id.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id required").dump(), "application/json");
+            return;
+        }
+        if ((slot_ref.empty() && state_ref.empty()) || (!slot_ref.empty() && !state_ref.empty())) {
+            res.status = 400;
+            res.set_content(err_json("provide exactly one of slot_ref or state_ref").dump(), "application/json");
             return;
         }
         auto bi = get_nonce_balance();
@@ -2782,17 +5395,753 @@ int main(int argc, char** argv) {
         tx.to_ = circle_id;
         tx.amount = "0";
         tx.nonce = bi.nonce + 1;
-        tx.ou = parse_ou(body, "5000");
+        tx.ou = parse_ou(body, "1000");
         tx.timestamp = now_ts();
-        tx.op_type = "circle_asset_put_encrypted";
+        tx.op_type = "circle_slot_policy_put";
+        json payload;
+        if (!slot_ref.empty()) payload["slot_ref"] = slot_ref;
+        if (!state_ref.empty()) payload["state_ref"] = state_ref;
+        if (!delivery_key_id.empty()) payload["delivery_key_id"] = delivery_key_id;
+        if (!activate_after_epoch.empty()) payload["activate_after_epoch"] = activate_after_epoch;
+        if (!expire_after_epoch.empty()) payload["expire_after_epoch"] = expire_after_epoch;
+        if (tombstone) payload["tombstone"] = tombstone;
+        if (revoked) payload["revoked"] = revoked;
+        tx.message = payload.dump();
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/state_descriptor_put", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string state_ref = body.value("state_ref", "");
+        if (circle_id.empty() || state_ref.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id and state_ref required").dump(), "application/json");
+            return;
+        }
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id;
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, "1000");
+        tx.timestamp = now_ts();
+        tx.op_type = "circle_state_descriptor_put";
+        json payload;
+        payload["state_ref"] = state_ref;
+        if (body.contains("state_class")) payload["state_class"] = body["state_class"];
+        if (body.contains("codec")) payload["codec"] = body["codec"];
+        if (body.contains("schema_hash")) payload["schema_hash"] = body["schema_hash"];
+        if (body.contains("subject_addr")) payload["subject_addr"] = body["subject_addr"];
+        if (body.contains("hfhe_profile")) payload["hfhe_profile"] = body["hfhe_profile"];
+        if (body.contains("mutable_state")) payload["mutable_state"] = body["mutable_state"];
+        tx.message = payload.dump();
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/balance_cell_put", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string state_ref = body.value("state_ref", "");
+        std::string ciphertext_b64 = body.value("ciphertext_b64", "");
+        std::string key_id = body.value("key_id", "");
+        std::string plaintext_hash = body.value("plaintext_hash", "");
+        std::string ciphertext_commitment = body.value("ciphertext_commitment", "");
+        std::string amount_commitment = body.value("amount_commitment", "");
+        if (circle_id.empty() || state_ref.empty() || ciphertext_b64.empty() || key_id.empty() || plaintext_hash.empty() || ciphertext_commitment.empty() || amount_commitment.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id, state_ref, ciphertext_b64, key_id, plaintext_hash, ciphertext_commitment, and amount_commitment required").dump(), "application/json");
+            return;
+        }
+        if (ciphertext_b64.size() > CIRCLE_ASSET_MAX_B64_BYTES) {
+            res.status = 400;
+            res.set_content(err_json("circle asset body exceeds max encoded size").dump(), "application/json");
+            return;
+        }
+        auto read_optional_scalar = [&](const char* key) -> std::string {
+            if (!body.contains(key)) {
+                return "";
+            }
+            if (body[key].is_string()) {
+                return body[key].get<std::string>();
+            }
+            if (body[key].is_number_integer()) {
+                return std::to_string(body[key].get<long long>());
+            }
+            return "";
+        };
+        std::string activate_after_epoch = read_optional_scalar("activate_after_epoch");
+        std::string expire_after_epoch = read_optional_scalar("expire_after_epoch");
+        const std::string default_ou = std::to_string(circle_asset_ou_from_b64_len(ciphertext_b64.size()));
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id;
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, default_ou);
+        tx.timestamp = now_ts();
+        tx.op_type = "circle_balance_cell_put";
         tx.encrypted_data = ciphertext_b64;
         json payload;
-        payload["path"] = path;
-        payload["content_type"] = content_type;
+        payload["state_ref"] = state_ref;
         payload["key_id"] = key_id;
         payload["plaintext_hash"] = plaintext_hash;
-        if (!encoding.empty()) payload["encoding"] = encoding;
-        if (!padding_class.empty()) payload["padding_class"] = padding_class;
+        payload["ciphertext_commitment"] = ciphertext_commitment;
+        payload["amount_commitment"] = amount_commitment;
+        if (body.contains("content_type")) payload["content_type"] = body["content_type"];
+        if (body.contains("encoding")) payload["encoding"] = body["encoding"];
+        if (body.contains("padding_class")) payload["padding_class"] = body["padding_class"];
+        if (body.contains("delivery_key_id")) payload["delivery_key_id"] = body["delivery_key_id"];
+        if (!activate_after_epoch.empty()) payload["activate_after_epoch"] = activate_after_epoch;
+        if (!expire_after_epoch.empty()) payload["expire_after_epoch"] = expire_after_epoch;
+        if (body.contains("metadata_mode")) payload["metadata_mode"] = body["metadata_mode"];
+        if (body.contains("codec")) payload["codec"] = body["codec"];
+        if (body.contains("schema_hash")) payload["schema_hash"] = body["schema_hash"];
+        if (body.contains("subject_addr")) payload["subject_addr"] = body["subject_addr"];
+        if (body.contains("mutable_state")) payload["mutable_state"] = body["mutable_state"];
+        if (body.contains("hfhe_profile")) payload["hfhe_profile"] = body["hfhe_profile"];
+        if (body.contains("proof_kind")) payload["proof_kind"] = body["proof_kind"];
+        if (body.contains("proof_receipt_hash")) payload["proof_receipt_hash"] = body["proof_receipt_hash"];
+        tx.message = payload.dump();
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/register_cell_put", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string state_ref = body.value("state_ref", "");
+        std::string ciphertext_b64 = body.value("ciphertext_b64", "");
+        std::string key_id = body.value("key_id", "");
+        std::string plaintext_hash = body.value("plaintext_hash", "");
+        std::string ciphertext_commitment = body.value("ciphertext_commitment", "");
+        if (circle_id.empty() || state_ref.empty() || ciphertext_b64.empty() || key_id.empty() || plaintext_hash.empty() || ciphertext_commitment.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id, state_ref, ciphertext_b64, key_id, plaintext_hash, and ciphertext_commitment required").dump(), "application/json");
+            return;
+        }
+        if (ciphertext_b64.size() > CIRCLE_ASSET_MAX_B64_BYTES) {
+            res.status = 400;
+            res.set_content(err_json("circle asset body exceeds max encoded size").dump(), "application/json");
+            return;
+        }
+        auto read_optional_scalar = [&](const char* key) -> std::string {
+            if (!body.contains(key)) {
+                return "";
+            }
+            if (body[key].is_string()) {
+                return body[key].get<std::string>();
+            }
+            if (body[key].is_number_integer()) {
+                return std::to_string(body[key].get<long long>());
+            }
+            return "";
+        };
+        std::string activate_after_epoch = read_optional_scalar("activate_after_epoch");
+        std::string expire_after_epoch = read_optional_scalar("expire_after_epoch");
+        const std::string default_ou = std::to_string(circle_asset_ou_from_b64_len(ciphertext_b64.size()));
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id;
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, default_ou);
+        tx.timestamp = now_ts();
+        tx.op_type = "circle_register_cell_put";
+        tx.encrypted_data = ciphertext_b64;
+        json payload;
+        payload["state_ref"] = state_ref;
+        payload["key_id"] = key_id;
+        payload["plaintext_hash"] = plaintext_hash;
+        payload["ciphertext_commitment"] = ciphertext_commitment;
+        if (body.contains("content_type")) payload["content_type"] = body["content_type"];
+        if (body.contains("encoding")) payload["encoding"] = body["encoding"];
+        if (body.contains("padding_class")) payload["padding_class"] = body["padding_class"];
+        if (body.contains("delivery_key_id")) payload["delivery_key_id"] = body["delivery_key_id"];
+        if (!activate_after_epoch.empty()) payload["activate_after_epoch"] = activate_after_epoch;
+        if (!expire_after_epoch.empty()) payload["expire_after_epoch"] = expire_after_epoch;
+        if (body.contains("metadata_mode")) payload["metadata_mode"] = body["metadata_mode"];
+        if (body.contains("codec")) payload["codec"] = body["codec"];
+        if (body.contains("schema_hash")) payload["schema_hash"] = body["schema_hash"];
+        if (body.contains("subject_addr")) payload["subject_addr"] = body["subject_addr"];
+        if (body.contains("mutable_state")) payload["mutable_state"] = body["mutable_state"];
+        if (body.contains("hfhe_profile")) payload["hfhe_profile"] = body["hfhe_profile"];
+        if (body.contains("proof_kind")) payload["proof_kind"] = body["proof_kind"];
+        if (body.contains("proof_receipt_hash")) payload["proof_receipt_hash"] = body["proof_receipt_hash"];
+        tx.message = payload.dump();
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/transport_policy_put", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        if (circle_id.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id required").dump(), "application/json");
+            return;
+        }
+        json payload = json::object();
+        if (body.contains("relay_mode")) payload["relay_mode"] = body["relay_mode"];
+        if (body.contains("lease_class")) payload["lease_class"] = body["lease_class"];
+        if (body.contains("claim_strategy")) payload["claim_strategy"] = body["claim_strategy"];
+        if (body.contains("claim_topology")) payload["claim_topology"] = body["claim_topology"];
+        if (body.contains("quorum_mode")) payload["quorum_mode"] = body["quorum_mode"];
+        if (body.contains("ingress_strategy")) payload["ingress_strategy"] = body["ingress_strategy"];
+        if (body.contains("quorum_threshold")) payload["quorum_threshold"] = body["quorum_threshold"];
+        if (body.contains("quorum_weight_threshold")) payload["quorum_weight_threshold"] = body["quorum_weight_threshold"];
+        if (body.contains("max_active_claims")) payload["max_active_claims"] = body["max_active_claims"];
+        if (body.contains("relay_allowlist")) payload["relay_allowlist"] = body["relay_allowlist"];
+        if (body.contains("relay_weights")) payload["relay_weights"] = body["relay_weights"];
+        if (body.contains("max_claim_window_epochs")) payload["max_claim_window_epochs"] = body["max_claim_window_epochs"];
+        if (body.contains("max_response_bytes")) payload["max_response_bytes"] = body["max_response_bytes"];
+        if (body.contains("require_response_ciphertext")) payload["require_response_ciphertext"] = body["require_response_ciphertext"];
+        if (body.contains("require_external_receipt")) payload["require_external_receipt"] = body["require_external_receipt"];
+        if (body.contains("accepted_result_codes")) payload["accepted_result_codes"] = body["accepted_result_codes"];
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id;
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, "1000");
+        tx.timestamp = now_ts();
+        tx.op_type = "circle_transport_policy_put";
+        tx.message = payload.dump();
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/hfhe_policy_put", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        if (circle_id.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id required").dump(), "application/json");
+            return;
+        }
+        json payload = json::object();
+        if (body.contains("load_pk_mode")) payload["load_pk_mode"] = body["load_pk_mode"];
+        if (body.contains("encrypt_mode")) payload["encrypt_mode"] = body["encrypt_mode"];
+        if (body.contains("decrypt_mode")) payload["decrypt_mode"] = body["decrypt_mode"];
+        if (body.contains("cipher_arithmetic_mode")) payload["cipher_arithmetic_mode"] = body["cipher_arithmetic_mode"];
+        if (body.contains("commit_mode")) payload["commit_mode"] = body["commit_mode"];
+        if (body.contains("pedersen_mode")) payload["pedersen_mode"] = body["pedersen_mode"];
+        if (body.contains("cipher_serde_mode")) payload["cipher_serde_mode"] = body["cipher_serde_mode"];
+        if (body.contains("pubkey_serde_mode")) payload["pubkey_serde_mode"] = body["pubkey_serde_mode"];
+        if (body.contains("verify_zero_mode")) payload["verify_zero_mode"] = body["verify_zero_mode"];
+        if (body.contains("verify_range_mode")) payload["verify_range_mode"] = body["verify_range_mode"];
+        if (body.contains("verify_bound_mode")) payload["verify_bound_mode"] = body["verify_bound_mode"];
+        if (body.contains("proof_receipt_signer_mode")) payload["proof_receipt_signer_mode"] = body["proof_receipt_signer_mode"];
+        if (body.contains("proof_receipt_class")) payload["proof_receipt_class"] = body["proof_receipt_class"];
+        if (body.contains("pk_allowlist")) payload["pk_allowlist"] = body["pk_allowlist"];
+        if (body.contains("require_live_key_policy")) payload["require_live_key_policy"] = body["require_live_key_policy"];
+        if (body.contains("require_receipt_transport_binding")) payload["require_receipt_transport_binding"] = body["require_receipt_transport_binding"];
+        if (body.contains("encrypt_proof")) payload["encrypt_proof"] = body["encrypt_proof"];
+        if (body.contains("decrypt_proof")) payload["decrypt_proof"] = body["decrypt_proof"];
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id;
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, "1000");
+        tx.timestamp = now_ts();
+        tx.op_type = "circle_hfhe_policy_put";
+        tx.message = payload.dump();
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/key_grant", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string key_id = body.value("key_id", "");
+        if (circle_id.empty() || key_id.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id and key_id required").dump(), "application/json");
+            return;
+        }
+        json payload = json::object();
+        payload["key_id"] = key_id;
+        if (body.contains("activate_after_epoch")) payload["activate_after_epoch"] = body["activate_after_epoch"];
+        if (body.contains("expire_after_epoch")) payload["expire_after_epoch"] = body["expire_after_epoch"];
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id;
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, "1000");
+        tx.timestamp = now_ts();
+        tx.op_type = "circle_key_grant";
+        tx.message = payload.dump();
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/key_extend", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string key_id = body.value("key_id", "");
+        if (circle_id.empty() || key_id.empty() || !body.contains("expire_after_epoch")) {
+            res.status = 400;
+            res.set_content(err_json("circle_id, key_id, and expire_after_epoch required").dump(), "application/json");
+            return;
+        }
+        json payload = json::object();
+        payload["key_id"] = key_id;
+        payload["expire_after_epoch"] = body["expire_after_epoch"];
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id;
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, "1000");
+        tx.timestamp = now_ts();
+        tx.op_type = "circle_key_extend";
+        tx.message = payload.dump();
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/key_revoke", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string key_id = body.value("key_id", "");
+        if (circle_id.empty() || key_id.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id and key_id required").dump(), "application/json");
+            return;
+        }
+        json payload = json::object();
+        payload["key_id"] = key_id;
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id;
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, "1000");
+        tx.timestamp = now_ts();
+        tx.op_type = "circle_key_revoke";
+        tx.message = payload.dump();
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/key_erase", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string key_id = body.value("key_id", "");
+        if (circle_id.empty() || key_id.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id and key_id required").dump(), "application/json");
+            return;
+        }
+        json payload = json::object();
+        payload["key_id"] = key_id;
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id;
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, "1000");
+        tx.timestamp = now_ts();
+        tx.op_type = "circle_key_erase";
+        tx.message = payload.dump();
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/key_policy_put", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string key_id = body.value("key_id", "");
+        if (circle_id.empty() || key_id.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id and key_id required").dump(), "application/json");
+            return;
+        }
+        json payload = json::object();
+        payload["key_id"] = key_id;
+        if (body.contains("activate_after_epoch")) payload["activate_after_epoch"] = body["activate_after_epoch"];
+        if (body.contains("expire_after_epoch")) payload["expire_after_epoch"] = body["expire_after_epoch"];
+        payload["revoked"] = body.value("revoked", false);
+        payload["erased"] = body.value("erased", false);
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id;
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, "1000");
+        tx.timestamp = now_ts();
+        tx.op_type = "circle_key_policy_put";
+        tx.message = payload.dump();
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/relay_claim", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string intent_id = body.value("intent_id", "");
+        std::string claim_epoch;
+        std::string claim_expiry_epoch;
+        if (body.contains("claim_epoch")) {
+            claim_epoch = body["claim_epoch"].is_string()
+              ? body["claim_epoch"].get<std::string>()
+              : std::to_string(body["claim_epoch"].get<long long>());
+        }
+        if (body.contains("claim_expiry_epoch")) {
+            claim_expiry_epoch = body["claim_expiry_epoch"].is_string()
+              ? body["claim_expiry_epoch"].get<std::string>()
+              : std::to_string(body["claim_expiry_epoch"].get<long long>());
+        }
+        if (circle_id.empty() || intent_id.empty() || claim_epoch.empty() || claim_expiry_epoch.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id, intent_id, claim_epoch, and claim_expiry_epoch required").dump(), "application/json");
+            return;
+        }
+        const std::string subject =
+            "octra_circle_relay_claim|" + circle_id + "|" + intent_id + "|" +
+            g_wallet.addr + "|" + claim_epoch + "|" + claim_expiry_epoch;
+        const std::string signature = octra::ed25519_sign_detached(
+            reinterpret_cast<const uint8_t*>(subject.data()),
+            subject.size(),
+            g_wallet.sk);
+        json payload;
+        payload["intent_id"] = intent_id;
+        payload["relay_id"] = g_wallet.addr;
+        payload["claim_epoch"] = claim_epoch;
+        payload["claim_expiry_epoch"] = claim_expiry_epoch;
+        payload["signature"] = signature;
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id;
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, "2000");
+        tx.timestamp = now_ts();
+        tx.op_type = "circle_relay_claim";
+        tx.message = payload.dump();
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/relay_cancel", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string intent_id = body.value("intent_id", "");
+        std::string related_key_id = body.value("related_key_id", "");
+        std::string cancel_epoch;
+        if (body.contains("cancel_epoch")) {
+            cancel_epoch = body["cancel_epoch"].is_string()
+              ? body["cancel_epoch"].get<std::string>()
+              : std::to_string(body["cancel_epoch"].get<long long>());
+        }
+        std::string reason = body.value("reason", "relay_cancelled");
+        const std::array<std::string, 9> allowed_reasons = {
+            "relay_cancelled",
+            "owner_cancelled",
+            "intent_expired",
+            "claim_expired",
+            "claim_set_exhausted",
+            "delivery_key_inactive",
+            "delivery_key_expired",
+            "delivery_key_revoked",
+            "delivery_key_erased"
+        };
+        if (circle_id.empty() || intent_id.empty() || cancel_epoch.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id, intent_id, and cancel_epoch required").dump(), "application/json");
+            return;
+        }
+        if (std::find(allowed_reasons.begin(), allowed_reasons.end(), reason) == allowed_reasons.end()) {
+            res.status = 400;
+            res.set_content(err_json("invalid relay cancel reason").dump(), "application/json");
+            return;
+        }
+        const std::string subject =
+            "octra_circle_relay_cancel|" + circle_id + "|" + intent_id + "|" +
+            g_wallet.addr + "|" + cancel_epoch + "|" + reason + "|" + related_key_id;
+        const std::string signature = octra::ed25519_sign_detached(
+            reinterpret_cast<const uint8_t*>(subject.data()),
+            subject.size(),
+            g_wallet.sk);
+        json payload;
+        payload["intent_id"] = intent_id;
+        payload["relay_id"] = g_wallet.addr;
+        payload["cancel_epoch"] = cancel_epoch;
+        payload["reason"] = reason;
+        payload["signature"] = signature;
+        if (!related_key_id.empty()) payload["related_key_id"] = related_key_id;
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id;
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, "2000");
+        tx.timestamp = now_ts();
+        tx.op_type = "circle_relay_cancel";
+        tx.message = payload.dump();
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/outbox_open", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string intent_id = body.value("intent_id", "");
+        std::string relay_policy_hash = body.value("relay_policy_hash", "");
+        std::string payload_hash = body.value("payload_hash", "");
+        std::string ciphertext_blob_hash = body.value("ciphertext_blob_hash", "");
+        std::string delivery_key_id = body.value("delivery_key_id", "");
+        std::string route_hint = body.value("route_hint", "");
+        std::string callback_policy_hash = body.value("callback_policy_hash", "");
+        auto read_required_scalar = [&](const char* key) -> std::string {
+            if (!body.contains(key)) {
+                return "";
+            }
+            if (body[key].is_string()) {
+                return body[key].get<std::string>();
+            }
+            if (body[key].is_number_integer()) {
+                return std::to_string(body[key].get<long long>());
+            }
+            return "";
+        };
+        std::string expiry_epoch = read_required_scalar("expiry_epoch");
+        std::string max_response_bytes = read_required_scalar("max_response_bytes");
+        std::string fee_budget = read_required_scalar("fee_budget");
+        if (circle_id.empty() || intent_id.empty() || expiry_epoch.empty() || relay_policy_hash.empty() || payload_hash.empty() || max_response_bytes.empty() || fee_budget.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id, intent_id, expiry_epoch, relay_policy_hash, payload_hash, max_response_bytes, and fee_budget required").dump(), "application/json");
+            return;
+        }
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id;
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, "3000");
+        tx.timestamp = now_ts();
+        tx.op_type = "circle_outbox_open";
+        json payload;
+        payload["intent_id"] = intent_id;
+        payload["expiry_epoch"] = expiry_epoch;
+        payload["relay_policy_hash"] = relay_policy_hash;
+        payload["payload_hash"] = payload_hash;
+        payload["max_response_bytes"] = max_response_bytes;
+        payload["fee_budget"] = fee_budget;
+        if (!ciphertext_blob_hash.empty()) payload["ciphertext_blob_hash"] = ciphertext_blob_hash;
+        if (!delivery_key_id.empty()) payload["delivery_key_id"] = delivery_key_id;
+        if (!route_hint.empty()) payload["route_hint"] = route_hint;
+        if (!callback_policy_hash.empty()) payload["callback_policy_hash"] = callback_policy_hash;
+        tx.message = payload.dump();
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/ingress_commit", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string intent_id = body.value("intent_id", "");
+        std::string relay_id = body.value("relay_id", "");
+        std::string response_payload_hash = body.value("response_payload_hash", "");
+        std::string response_ciphertext_blob_hash = body.value("response_ciphertext_blob_hash", "");
+        std::string external_receipt_hash = body.value("external_receipt_hash", "");
+        std::string signature = body.value("signature", "");
+        auto read_required_scalar = [&](const char* key) -> std::string {
+            if (!body.contains(key)) {
+                return "";
+            }
+            if (body[key].is_string()) {
+                return body[key].get<std::string>();
+            }
+            if (body[key].is_number_integer()) {
+                return std::to_string(body[key].get<long long>());
+            }
+            return "";
+        };
+        std::string ingress_nonce = read_required_scalar("ingress_nonce");
+        std::string response_size_bytes = read_required_scalar("response_size_bytes");
+        int result_code = body.value("result_code", 0);
+        if (circle_id.empty() || intent_id.empty() || relay_id.empty() || ingress_nonce.empty() || response_payload_hash.empty() || response_size_bytes.empty() || signature.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id, intent_id, relay_id, ingress_nonce, response_payload_hash, response_size_bytes, and signature required").dump(), "application/json");
+            return;
+        }
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id;
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, "3000");
+        tx.timestamp = now_ts();
+        tx.op_type = "circle_ingress_commit";
+        json payload;
+        payload["intent_id"] = intent_id;
+        payload["relay_id"] = relay_id;
+        payload["ingress_nonce"] = ingress_nonce;
+        payload["result_code"] = result_code;
+        payload["response_payload_hash"] = response_payload_hash;
+        payload["response_size_bytes"] = response_size_bytes;
+        payload["signature"] = signature;
+        if (!response_ciphertext_blob_hash.empty()) payload["response_ciphertext_blob_hash"] = response_ciphertext_blob_hash;
+        if (!external_receipt_hash.empty()) payload["external_receipt_hash"] = external_receipt_hash;
         tx.message = payload.dump();
         sign_tx_fields(tx);
         auto result = submit_tx(tx);

@@ -2891,7 +2891,7 @@ async function revealPrivateKeys() {
 async function loadSettings() {
   try {
     var w = await api('GET', '/wallet');
-    $('settings-rpc').value = w.rpc_url || 'http://46.101.86.250:8080';
+    $('settings-rpc').value = w.rpc_url || 'https://octra.network/rpc';
     $('settings-explorer').value = w.explorer_url || 'https://octrascan.io';
     $('settings-bridge-signer').value = w.bridge_signer_url || 'https://relayer-002838819188.octra.network';
     _networkPreset = detectNetworkPreset($('settings-rpc').value, $('settings-explorer').value);
